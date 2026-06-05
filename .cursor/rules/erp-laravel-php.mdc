@@ -1,0 +1,32 @@
+---
+alwaysApply: true
+---
+# Laravel Conventions (this project)
+
+## Layering
+
+- **Controller**: validate request, resolve DTOs, call service, return JSON/view
+- **Service**: business logic, DB operations, conversions
+- **Conversion services**: one class per table conversion under `app/Services/Conversions/`
+
+## Data transfer pattern
+
+```php
+// Explicit field mapping — one line per field
+protected function mapRow(object $old): array
+{
+    return [
+        'company_code' => $old->companycde,
+        'company_description' => $old->companydsc,
+    ];
+}
+```
+
+- Register new conversions in `ConversionRegistry`
+- Wire UI checkbox → controller `conversionOptions` → conversion key
+
+## Do not
+
+- Store connection/mapping config in the app database
+- Add generic auto-column-mapping helpers that hide field names
+- Expand scope beyond what was requested

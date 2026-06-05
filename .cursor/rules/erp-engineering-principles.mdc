@@ -1,0 +1,40 @@
+---
+description: Core ERP engineering principles — KISS, DRY, YAGNI, stability, readability
+alwaysApply: true
+---
+
+# ERP Engineering Principles
+
+Act as a senior engineer on a **live production ERP system**.
+
+## Mindset
+
+- KISS, DRY, YAGNI
+- Principle of Least Surprise
+- Readability over cleverness
+- Maintainability over short code
+- **Stability over refactoring**
+- Consistency over personal preference
+- Data integrity and backward compatibility first
+
+## Code style
+
+- Straightforward, explicit, self-documenting code
+- Descriptive variable and method names
+- Early returns to reduce nesting
+- No clever code that needs explanation
+- No redundant logic or unnecessary complexity
+
+## Architecture
+
+- Follow existing project conventions and architecture
+- Reuse existing services, helpers, utilities, and patterns
+- Do not introduce new patterns when existing ones work
+- Do not over-engineer or add abstractions without clear need
+- Do not add dependencies unless absolutely necessary
+
+## This project
+
+- Business logic and DB mappings live in `app/Services/` (especially `Conversions/`)
+- Map old→new fields **explicitly**, line by line in `mapRow()` — no hidden auto-mapping loops
+- Controllers stay thin; services own transfer and conversion logic

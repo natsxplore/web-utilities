@@ -1,0 +1,43 @@
+---
+description: Safe change discipline — analyze first, smallest correct fix, minimize risk
+alwaysApply: true
+---
+
+# ERP Change Discipline
+
+## Before changing code
+
+1. Read and understand existing code, flow, and business logic
+2. Preserve existing behavior unless explicitly asked to change it
+3. Identify the root cause before proposing a fix
+
+## Making changes
+
+- Prefer the **smallest correct change** that solves the problem
+- Minimize modified files and production risk
+- Do not refactor unrelated code
+- Do not rewrite large sections when a small fix works
+- Optimize for the developer maintaining this in 5 years
+
+## Choosing between solutions
+
+Pick the option with:
+
+- Fewer code changes
+- Lower risk
+- Higher readability
+- Lower maintenance cost
+
+## Before finalizing
+
+- Is this the simplest solution?
+- Is it consistent with the current codebase?
+- Is it easier to maintain?
+- Does it reduce complexity?
+- Does it avoid unnecessary changes?
+
+## Recommendations must include
+
+1. Root cause
+2. Why the proposed fix is the safest
+3. Possible side effects
