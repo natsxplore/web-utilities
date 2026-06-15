@@ -531,6 +531,14 @@ class DataTransferController extends Controller
                 $payload = [];
                 $seenSubClassificationIds = [];
 
+                $classificationDescriptionsById = $sourceDb->table('itemclassfile')
+                    ->pluck('itmcladsc', 'itmclacde')
+                    ->all();
+
+                foreach ($targetDb->table('mf_itemclassifications')->get(['item_classification_id', 'item_classification_description']) as $classificationRow) {
+                    $classificationDescriptionsById[$classificationRow->item_classification_id] = $classificationRow->item_classification_description;
+                }
+
                 // temporary turn off foreign key checks
                 $targetDb->statement('SET FOREIGN_KEY_CHECKS = 0');
                 $targetDb->table($newTableName)->delete();
@@ -553,11 +561,16 @@ class DataTransferController extends Controller
 
                     $seenSubClassificationIds[$old->itemsubclasscde] = true;
 
+                    $classificationId = trim((string) ($old->itmclacde ?? ''));
+
                     $payload[] = [
                         'item_subclassification_id' => $old->itemsubclasscde,
                         'item_subclassification_description' => $old->itemsubclassdsc,
                         'prev_item_subclassification_id' => $old->prev_itemsubclasscde,
-                        'item_classification_id' => $old->itmclacde,
+                        'item_classification_id' => $classificationId !== '' ? $classificationId : null,
+                        'item_classification_description' => $classificationId !== ''
+                            ? ($classificationDescriptionsById[$classificationId] ?? null)
+                            : null,
                         'location_id' => $old->locationcde,
                         'last_modified' => $old->lastmod,
                         'hide_subclass' => $old->hide_subclass,
@@ -903,7 +916,7 @@ class DataTransferController extends Controller
                 $chunkSize = 500;
                 $itemRows = 0;
                 $itemUnitRows = 0;
-                $nullifiedItemReferences = 0;
+                $skippedCorruptedItems = 0;
                 $payload = [];
                 $unitPayload = [];
                 $insertedItemIds = [];
@@ -946,35 +959,33 @@ class DataTransferController extends Controller
                     $classificationId = trim((string) ($old->itmclacde ?? ''));
                     $subClassificationId = trim((string) ($old->itemsubclasscde ?? ''));
 
+                    $skipReason = null;
+
                     if ($classificationId === '' || ! isset($validClassificationIds[$classificationId])) {
-                        if ($classificationId !== '') {
-                            $nullifiedItemReferences++;
-                            $note = "Set item_classification_id to null for item \"{$old->itmcde}\" ({$old->itmdsc}): \"{$classificationId}\" not found in mf_itemclassifications.";
-                            $conversionNotes[] = $note;
-                            Log::warning($note, [
-                                'conversion' => 'item',
-                                'item_id' => $old->itmcde,
-                                'item_classification_id' => $classificationId,
-                                'source_database' => $source->database,
-                                'target_database' => $target->database,
-                            ]);
-                        }
-                        $classificationId = null;
+                        $skipReason = $classificationId === ''
+                            ? 'missing item_classification_id'
+                            : "item_classification_id \"{$classificationId}\" not found in mf_itemclassifications";
+                    } elseif ($subClassificationId !== '' && ! isset($validSubClassificationIds[$subClassificationId])) {
+                        $skipReason = "item_sub_classification_id \"{$subClassificationId}\" not found in mf_itemsubclassifications";
                     }
 
-                    if ($subClassificationId !== '' && ! isset($validSubClassificationIds[$subClassificationId])) {
-                        $nullifiedItemReferences++;
-                        $note = "Set item_sub_classification_id to null for item \"{$old->itmcde}\" ({$old->itmdsc}): \"{$subClassificationId}\" not found in mf_itemsubclassifications.";
+                    if ($skipReason !== null) {
+                        $skippedCorruptedItems++;
+                        $note = "Skipped corrupted item \"{$old->itmcde}\" ({$old->itmdsc}): {$skipReason}.";
                         $conversionNotes[] = $note;
                         Log::warning($note, [
                             'conversion' => 'item',
                             'item_id' => $old->itmcde,
-                            'item_sub_classification_id' => $subClassificationId,
+                            'item_classification_id' => $classificationId !== '' ? $classificationId : null,
+                            'item_sub_classification_id' => $subClassificationId !== '' ? $subClassificationId : null,
                             'source_database' => $source->database,
                             'target_database' => $target->database,
                         ]);
-                        $subClassificationId = null;
-                    } elseif ($subClassificationId === '') {
+
+                        continue;
+                    }
+
+                    if ($subClassificationId === '') {
                         $subClassificationId = null;
                     }
 
@@ -1141,8 +1152,8 @@ class DataTransferController extends Controller
 
                 $totalRows += $itemRows + $itemUnitRows;
                 $itemSummary = "{$oldTableName} → {$newTableName} ({$itemRows} row(s))";
-                if ($nullifiedItemReferences > 0) {
-                    $itemSummary .= ", {$nullifiedItemReferences} invalid reference(s) set to null";
+                if ($skippedCorruptedItems > 0) {
+                    $itemSummary .= ", {$skippedCorruptedItems} corrupted item(s) skipped";
                 }
                 $transferredTables[] = $itemSummary;
                 $transferredTables[] = "{$oldUnitTableName} → {$newUnitTableName} ({$itemUnitRows} row(s))";
