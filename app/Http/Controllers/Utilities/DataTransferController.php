@@ -993,7 +993,7 @@ class DataTransferController extends Controller
 
                     $payload[] = [
                         'item_id' => $old->itmcde,
-                        'item_description' => $old->itmdsc,
+                        'item_description' => trim((string) ($old->itmdsc ?? '')),
                         'unit_of_measure' => $old->untmea,
                         'unit_of_measure_id' => $this->resolveUnitOfMeasureId($old->untmea, $defaultUnitOfMeasureId, $unitOfMeasureIdsByCode),
                         'reorder_level' => $old->crilvl,
@@ -1537,6 +1537,7 @@ class DataTransferController extends Controller
                 $priceCodeFile2Rows = 0;
                 $priceCodeFile3Rows = 0;
                 $priceCodeFile4Rows = 0;
+                $skippedPriceCodeFile2Rows = 0;
                 $ensuredBranchIds = [];
                 $priceDescriptionsByPriceId = [];
 
@@ -1578,17 +1579,83 @@ class DataTransferController extends Controller
                     $priceCodeFile1Rows += count($payload);
                 }
 
+                $validPriceIds = array_fill_keys(array_keys($priceDescriptionsByPriceId), true);
+                $itemDescriptionsById = [];
+                foreach ($targetDb->table('mf_items')->get(['item_id', 'item_description']) as $itemRow) {
+                    $itemDescriptionsById[$itemRow->item_id] = trim((string) ($itemRow->item_description ?? ''));
+                }
+
                 $payload = [];
                 foreach ($sourceDb->table('pricecodefile2')->orderBy('recid')->lazy($chunkSize) as $old) {
+                    $priceId = trim((string) ($old->prccde ?? ''));
+                    $itemId = trim((string) ($old->itmcde ?? ''));
+                    $itemDescription = trim((string) ($old->itmdsc ?? ''));
+
+                    if ($priceId === '' || ! isset($validPriceIds[$priceId])) {
+                        $skippedPriceCodeFile2Rows++;
+                        $note = "Skipped price list detail for item \"{$itemId}\" ({$itemDescription}): price_id \"{$priceId}\" not found in mf_price_code_file1.";
+                        $conversionNotes[] = $note;
+                        Log::warning($note, [
+                            'conversion' => 'price_list',
+                            'price_id' => $priceId,
+                            'item_id' => $itemId,
+                            'source_database' => $source->database,
+                            'target_database' => $target->database,
+                        ]);
+
+                        continue;
+                    }
+
+                    if ($itemId === '' || ! array_key_exists($itemId, $itemDescriptionsById)) {
+                        $skippedPriceCodeFile2Rows++;
+                        $note = "Skipped price list detail for price \"{$priceId}\": item_id \"{$itemId}\" not found in mf_items.";
+                        $conversionNotes[] = $note;
+                        Log::warning($note, [
+                            'conversion' => 'price_list',
+                            'price_id' => $priceId,
+                            'item_id' => $itemId,
+                            'source_database' => $source->database,
+                            'target_database' => $target->database,
+                        ]);
+
+                        continue;
+                    }
+
+                    $masterItemDescription = $itemDescriptionsById[$itemId];
+
+                    if ($itemDescription !== $masterItemDescription) {
+                        $skippedPriceCodeFile2Rows++;
+                        $note = "Skipped price list detail for price \"{$priceId}\": item_id \"{$itemId}\" description \"{$itemDescription}\" does not match item master \"{$masterItemDescription}\".";
+                        $conversionNotes[] = $note;
+                        Log::warning($note, [
+                            'conversion' => 'price_list',
+                            'price_id' => $priceId,
+                            'item_id' => $itemId,
+                            'item_description' => $itemDescription,
+                            'master_item_description' => $masterItemDescription,
+                            'source_database' => $source->database,
+                            'target_database' => $target->database,
+                        ]);
+
+                        continue;
+                    }
+
                     $this->ensureBranchExists($sourceDb, $targetDb, $old->brhcde, $now, $ensuredBranchIds, $conversionNotes);
+
+                    $unitPrice = $old->untprc;
+                    $grossPrice = $old->groprc;
+
+                    if (is_numeric($unitPrice) && (float) $unitPrice != 0.0 && (! is_numeric($grossPrice) || (float) $grossPrice == 0.0)) {
+                        $grossPrice = $unitPrice;
+                    }
 
                     $payload[] = [
                         'price_id' => $old->prccde,
                         'item_id' => $old->itmcde,
-                        'item_description' => $old->itmdsc,
+                        'item_description' => $masterItemDescription,
                         'unit_of_measure' => $old->untmea,
-                        'gross_price' => $old->groprc,
-                        'unit_price' => $old->untprc,
+                        'gross_price' => $grossPrice,
+                        'unit_price' => $unitPrice,
                         'unit_cost' => $old->untcst,
                         'currency_id' => $old->curcde,
                         'discount_percent' => $old->disper,
@@ -1661,7 +1728,11 @@ class DataTransferController extends Controller
 
                 $totalRows += $priceCodeFile1Rows + $priceCodeFile2Rows + $priceCodeFile3Rows + $priceCodeFile4Rows;
                 $transferredTables[] = "pricecodefile1 → mf_price_code_file1 ({$priceCodeFile1Rows} row(s))";
-                $transferredTables[] = "pricecodefile2 → mf_price_code_file2 ({$priceCodeFile2Rows} row(s))";
+                $priceCodeFile2Summary = "pricecodefile2 → mf_price_code_file2 ({$priceCodeFile2Rows} row(s))";
+                if ($skippedPriceCodeFile2Rows > 0) {
+                    $priceCodeFile2Summary .= ", {$skippedPriceCodeFile2Rows} row(s) skipped (missing item, parent price, or description mismatch)";
+                }
+                $transferredTables[] = $priceCodeFile2Summary;
                 $transferredTables[] = "pricecodefile3 → mf_price_code_file3 ({$priceCodeFile3Rows} row(s))";
                 $transferredTables[] = "pricecodefile4 → mf_price_code_file4 ({$priceCodeFile4Rows} row(s))";
             }
