@@ -158,7 +158,7 @@
                             ['id' => 'company_file', 'label' => 'Company file', 'hint' => 'companyfile → companyfile'],
                             ['id' => 'system_parameter', 'label' => 'System Parameter', 'hint' => 'syspar → sys_setup'],
                             ['id' => 'branch', 'label' => 'Branch', 'hint' => 'branchfile → mf_branch'],
-                            ['id' => 'user_file', 'label' => 'User File', 'hint' => 'pos_userfile → mf_pos_users + users'],
+                            ['id' => 'user_file', 'label' => 'User File', 'hint' => 'pos_userfile → mf_pos_users, users → users (POS access only)'],
                             ['id' => 'currency', 'label' => 'Currency', 'hint' => 'currencyfile → currency_file'],
                             ['id' => 'tax_code', 'label' => 'Tax Code', 'hint' => null],
                             ['id' => 'item_classification', 'label' => 'Item Classification', 'hint' => null],
@@ -175,8 +175,8 @@
                             ['id' => 'void_reason', 'label' => 'Void Reason', 'hint' => null],
                             ['id' => 'cash_in_out_reason', 'label' => 'Cash In/Out Reason', 'hint' => null],
                             ['id' => 'price_list', 'label' => 'Price List', 'hint' => null],
-                            ['id' => 'inventory_transaction', 'label' => 'Inventory Transaction', 'hint' => null],
-                            ['id' => 'physical_count', 'label' => 'Physical Count', 'hint' => null],
+                            ['id' => 'inventory_transaction', 'label' => 'Inventory Transaction', 'hint' => 'trantypefile → mf_inventory_transactiontypes, inventorytranfile1/2 → trn_inventory_transaction_file1/2'],
+                            ['id' => 'physical_count', 'label' => 'Physical Count', 'hint' => 'physicalcountfile1/2/3/31 → trn_physical_count_file1/2/3/31'],
                         ] as $option)
                             <label class="flex items-start gap-3 rounded-md px-2 py-2 cursor-pointer hover:bg-zinc-50">
                                 <input type="checkbox" id="{{ $option['id'] }}" value="1" class="conversion-option mt-0.5 h-4 w-4 rounded border-zinc-300 text-emerald-600">

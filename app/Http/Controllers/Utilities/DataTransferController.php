@@ -384,11 +384,13 @@ class DataTransferController extends Controller
 
                 // 1. pos_userfile → mf_pos_users + users (app login)
                 if ($this->sourceTableExists($sourceDb, 'pos_userfile')) {
+
                 if ($companyId === '') {
                     throw new RuntimeException('Company ID is required for users conversion (used as first_name). Enter it in the Company ID field.');
                 }
 
                 $posUserPayload = [];
+
                 $appUserPayload = [];
                 $posUserUpdateColumns = [
                     'username',
@@ -402,6 +404,7 @@ class DataTransferController extends Controller
                     'card_number',
                     'updated_at',
                 ];
+
                 $appUserUpdateColumns = [
                     'username',
                     'last_name',
@@ -412,6 +415,7 @@ class DataTransferController extends Controller
                 ];
 
                 foreach ($sourceDb->table('pos_userfile')->orderBy('recid')->lazy($chunkSize) as $old) {
+
                     $userId = trim((string) ($old->usrcde ?? ''));
                     if ($userId === '') {
                         continue;
@@ -1447,6 +1451,27 @@ class DataTransferController extends Controller
                     ->flip()
                     ->all();
 
+                $validAccountIds = [];
+                if ($this->sourceTableExists($targetDb, 'accounts')) {
+                    foreach ($targetDb->table('accounts')->pluck('account_id') as $accountId) {
+                        $validAccountIds[(string) $accountId] = true;
+                    }
+                }
+
+                $validTaxIds = $targetDb->table('mf_vat_codes')->pluck('tax_id')->flip()->all();
+                $validCurrencyIds = $targetDb->table('mf_currencies')->pluck('currency_id')->flip()->all();
+                $validMemcIds = $targetDb->table('mf_memcfile')->pluck('memc_id')->flip()->all();
+
+                $validGlDepartmentIds = [];
+                $glDepartmentTable = $this->sourceTableExists($targetDb, 'mf_gldepartments')
+                    ? 'mf_gldepartments'
+                    : ($this->sourceTableExists($targetDb, 'mf_gl_departments') ? 'mf_gl_departments' : null);
+                if ($glDepartmentTable !== null) {
+                    foreach ($targetDb->table($glDepartmentTable)->pluck('gl_department_id') as $glDepartmentId) {
+                        $validGlDepartmentIds[(string) $glDepartmentId] = true;
+                    }
+                }
+
                 $itemCodesWithUnits = $sourceDb->table($oldUnitTableName)
                     ->distinct()
                     ->pluck('itmcde')
@@ -1529,30 +1554,30 @@ class DataTransferController extends Controller
                         'item_type' => $old->itmtyp,
                         'item_classification_id' => $classificationId,
                         'item_sub_classification_id' => $subClassificationId,
-                        'cgs_account_id' => $old->cgsactcde,
-                        'sales_discount_account_id' => $old->saldisact,
-                        'purchase_discount_account_id' => $old->purdisact,
-                        'sales_account_id' => $old->salactcde,
-                        'inventory_account_id' => $old->invactcde,
-                        'sales_return_account_id' => $old->srtactcde,
-                        'tax_id' => $old->taxcde,
-                        'purchase_return_account_id' => $old->prtactcde,
-                        'purchase_account_id' => $old->puractcde,
-                        'purchase_tax_id' => $old->purtaxcde,
-                        'sales_ewt_id' => $old->salewtcde,
-                        'purchase_ewt_id' => $old->purewtcde,
-                        'sales_evat_id' => $old->salevatcde,
-                        'purchase_evat_id' => $old->purevatcde,
-                        'sales_currency_id' => $old->salcur,
-                        'purchase_currency_id' => $old->purcur,
+                        'cgs_account_id' => $this->resolveForeignKeyId($old->cgsactcde, $validAccountIds, $nullifiedItemReferences),
+                        'sales_discount_account_id' => $this->resolveForeignKeyId($old->saldisact, $validAccountIds, $nullifiedItemReferences),
+                        'purchase_discount_account_id' => $this->resolveForeignKeyId($old->purdisact, $validAccountIds, $nullifiedItemReferences),
+                        'sales_account_id' => $this->resolveForeignKeyId($old->salactcde, $validAccountIds, $nullifiedItemReferences),
+                        'inventory_account_id' => $this->resolveForeignKeyId($old->invactcde, $validAccountIds, $nullifiedItemReferences),
+                        'sales_return_account_id' => $this->resolveForeignKeyId($old->srtactcde, $validAccountIds, $nullifiedItemReferences),
+                        'tax_id' => $this->resolveForeignKeyId($old->taxcde, $validTaxIds, $nullifiedItemReferences),
+                        'purchase_return_account_id' => $this->resolveForeignKeyId($old->prtactcde, $validAccountIds, $nullifiedItemReferences),
+                        'purchase_account_id' => $this->resolveForeignKeyId($old->puractcde, $validAccountIds, $nullifiedItemReferences),
+                        'purchase_tax_id' => $this->resolveForeignKeyId($old->purtaxcde, $validTaxIds, $nullifiedItemReferences),
+                        'sales_ewt_id' => $this->resolveForeignKeyId($old->salewtcde, $validTaxIds, $nullifiedItemReferences),
+                        'purchase_ewt_id' => $this->resolveForeignKeyId($old->purewtcde, $validTaxIds, $nullifiedItemReferences),
+                        'sales_evat_id' => $this->resolveForeignKeyId($old->salevatcde, $validTaxIds, $nullifiedItemReferences),
+                        'purchase_evat_id' => $this->resolveForeignKeyId($old->purevatcde, $validTaxIds, $nullifiedItemReferences),
+                        'sales_currency_id' => $this->resolveForeignKeyId($old->salcur, $validCurrencyIds, $nullifiedItemReferences),
+                        'purchase_currency_id' => $this->resolveForeignKeyId($old->purcur, $validCurrencyIds, $nullifiedItemReferences),
                         'item_picture1' => $old->itmpic,
                         'item_picture2' => $old->itmpic2,
                         'item_picture3' => $old->itmpic3,
                         'is_combo_meal' => $old->chkcombo,
-                        'memc_id' => $old->memc,
+                        'memc_id' => $this->resolveForeignKeyId($old->memc, $validMemcIds, $nullifiedItemReferences),
                         'foreign_description' => $old->itmdscforeign,
                         'non_trade' => $old->chknontrd,
-                        'gl_department_id' => $old->gldepcde,
+                        'gl_department_id' => $this->resolveForeignKeyId($old->gldepcde, $validGlDepartmentIds, $nullifiedItemReferences),
                         'item_number' => $old->itmnum,
                         'field01' => $old->field01,
                         'field02' => $old->field02,
@@ -1596,8 +1621,8 @@ class DataTransferController extends Controller
                             'gross_price' => $old->untprc,
                             'unit_price' => $old->untprc,
                             'discount_amount' => null,
-                            'sales_currency_id' => $old->salcur,
-                            'purchase_currency_id' => $old->purcur,
+                            'sales_currency_id' => $this->resolveForeignKeyId($old->salcur, $validCurrencyIds),
+                            'purchase_currency_id' => $this->resolveForeignKeyId($old->purcur, $validCurrencyIds),
                             'barcode_number' => $old->barcde,
                             'minimum_selling_price' => null,
                             'created_at' => $now,
@@ -1647,9 +1672,9 @@ class DataTransferController extends Controller
                         'unit_cost' => $old->untcst,
                         'gross_price' => $old->groprc,
                         'unit_price' => $old->untprc,
-                        'discount_amount' => $old->disamt,
-                        'sales_currency_id' => $old->salcur,
-                        'purchase_currency_id' => $old->purcur,
+                            'discount_amount' => $old->disamt,
+                            'sales_currency_id' => $this->resolveForeignKeyId($old->salcur, $validCurrencyIds),
+                            'purchase_currency_id' => $this->resolveForeignKeyId($old->purcur, $validCurrencyIds),
                         'barcode_number' => $old->barcde,
                         'minimum_selling_price' => $old->minselprc,
                         'created_at' => $now,
@@ -2256,6 +2281,766 @@ class DataTransferController extends Controller
             }
             #endregion
 
+            #region Inventory Transaction Conversion
+            if ($inventoryTransaction) {
+                $chunkSize = 500;
+                $ensuredBranchIds = [];
+                $transactionTypeRows = 0;
+                $inventoryFile1Rows = 0;
+                $inventoryFile2Rows = 0;
+                $skippedInventoryFile1Rows = 0;
+                $skippedInventoryFile2Rows = 0;
+                $nullifiedInventoryBranches = 0;
+                $transactionTypeSourceMissing = false;
+                $inventoryFile1SourceMissing = false;
+                $inventoryFile2SourceMissing = false;
+                $validTransactionTypeIds = [];
+
+                $hasInventorySource = $this->sourceTableExists($sourceDb, 'trantypefile')
+                    || $this->sourceTableExists($sourceDb, 'inventorytranfile1')
+                    || $this->sourceTableExists($sourceDb, 'inventorytranfile2');
+
+                if ($hasInventorySource) {
+                    $targetDb->statement('SET FOREIGN_KEY_CHECKS = 0');
+                    $targetDb->table('trn_inventory_transaction_file2')->delete();
+                    $targetDb->table('trn_inventory_transaction_file1')->delete();
+                    $targetDb->table('mf_inventory_transactiontypes')->delete();
+                    $targetDb->statement('SET FOREIGN_KEY_CHECKS = 1');
+                }
+
+                // 1. trantypefile → mf_inventory_transactiontypes
+                if ($this->sourceTableExists($sourceDb, 'trantypefile')) {
+                    $payload = [];
+
+                    foreach ($sourceDb->table('trantypefile')->orderBy('recid')->lazy($chunkSize) as $old) {
+                        $transactionTypeId = trim((string) ($this->optionalRowValue($old, 'trntypcde') ?? ''));
+                        if ($transactionTypeId === '') {
+                            continue;
+                        }
+
+                        $validTransactionTypeIds[$transactionTypeId] = true;
+
+                        $payload[] = [
+                            'transaction_type_id' => $transactionTypeId,
+                            'transaction_type_code' => $transactionTypeId,
+                            'document_number' => $this->optionalRowValue($old, 'docnum'),
+                            'transaction_type_description' => $this->optionalRowValue($old, 'trntypdsc'),
+                            'transaction_code' => $this->optionalRowValue($old, 'trncde'),
+                            'gl_account_id' => $this->optionalRowValue($old, 'gldepcde'),
+                            'created_at' => $now,
+                            'updated_at' => $now,
+                        ];
+
+                        if (count($payload) >= $chunkSize) {
+                            $targetDb->table('mf_inventory_transactiontypes')->insert($payload);
+                            $transactionTypeRows += count($payload);
+                            $payload = [];
+                        }
+                    }
+
+                    if ($payload !== []) {
+                        $targetDb->table('mf_inventory_transactiontypes')->insert($payload);
+                        $transactionTypeRows += count($payload);
+                    }
+                } else {
+                    $transactionTypeSourceMissing = true;
+                    $this->noteMissingSourceTable('trantypefile', $source, $target, $conversionNotes, 'inventory_transaction');
+
+                    foreach ($targetDb->table('mf_inventory_transactiontypes')->pluck('transaction_type_id') as $transactionTypeId) {
+                        $validTransactionTypeIds[(string) $transactionTypeId] = true;
+                    }
+                }
+
+                $validBranchIds = $targetDb->table('mf_branch')->pluck('branch_id')->flip()->all();
+
+                // 2. inventorytranfile1 → trn_inventory_transaction_file1
+                if ($this->sourceTableExists($sourceDb, 'inventorytranfile1')) {
+                    $payload = [];
+
+                    foreach ($sourceDb->table('inventorytranfile1')->orderBy('recid')->lazy($chunkSize) as $old) {
+                        $documentNumber = trim((string) ($this->optionalRowValue($old, 'docnum') ?? ''));
+                        $transactionTypeId = trim((string) ($this->optionalRowValue($old, 'trntypcde') ?? ''));
+
+                        if ($documentNumber === '' || $transactionTypeId === '') {
+                            $skippedInventoryFile1Rows++;
+
+                            continue;
+                        }
+
+                        if (! isset($validTransactionTypeIds[$transactionTypeId])) {
+                            $skippedInventoryFile1Rows++;
+                            $note = "Skipped inventory transaction header \"{$documentNumber}\": transaction_type_id \"{$transactionTypeId}\" not found in mf_inventory_transactiontypes.";
+                            $conversionNotes[] = $note;
+                            Log::warning($note, [
+                                'conversion' => 'inventory_transaction',
+                                'document_number' => $documentNumber,
+                                'transaction_type_id' => $transactionTypeId,
+                                'source_database' => $source->database,
+                                'target_database' => $target->database,
+                            ]);
+
+                            continue;
+                        }
+
+                        [$branchId, $branchNullified] = $this->resolveInventoryBranchId(
+                            $sourceDb,
+                            $targetDb,
+                            $this->optionalRowValue($old, 'brhcde'),
+                            $now,
+                            $validBranchIds,
+                            $ensuredBranchIds,
+                            $conversionNotes,
+                            "inventory transaction header \"{$documentNumber}\"",
+                        );
+                        if ($branchNullified) {
+                            $nullifiedInventoryBranches++;
+                        }
+
+                        $row = [
+                            'cancel_remarks' => $this->optionalRowValue($old, 'cancelrem'),
+                            'document_number' => $documentNumber,
+                            'transaction_code' => $this->optionalRowValue($old, 'trncde'),
+                            'transaction_total' => $this->optionalRowValue($old, 'trntot'),
+                            'user_id' => $this->optionalRowValue($old, 'usrnam'),
+                            'log_time' => $this->optionalRowValue($old, 'logtim'),
+                            'transaction_type_id' => $transactionTypeId,
+                            'warehouse_id' => $this->optionalRowValue($old, 'warcde'),
+                            'warehouse_id2' => $this->optionalRowValue($old, 'warcde2'),
+                            'reference_number' => $this->optionalRowValue($old, 'refnum'),
+                            'prepared_by' => $this->optionalRowValue($old, 'preby'),
+                            'check_by' => $this->optionalRowValue($old, 'chkby'),
+                            'approved_by' => $this->optionalRowValue($old, 'apvby'),
+                            'cancel_document' => $this->optionalRowValue($old, 'canceldoc'),
+                            'document_lock' => $this->optionalRowValue($old, 'doclock'),
+                            'transaction_date' => $this->optionalRowValue($old, 'trndte'),
+                            'log_date' => $this->optionalRowValue($old, 'logdte'),
+                            'cancel_date' => $this->optionalRowValue($old, 'canceldte'),
+                            'branch_id' => $branchId,
+                            'gl_department_id' => $this->optionalRowValue($old, 'gldepcde'),
+                            'deliver_status' => $this->optionalRowValue($old, 'delsta'),
+                            'created_at' => $now,
+                            'updated_at' => $now,
+                        ];
+
+                        for ($fieldIndex = 1; $fieldIndex <= 20; $fieldIndex++) {
+                            $fieldKey = sprintf('field%02d', $fieldIndex);
+                            $row[$fieldKey] = $this->optionalRowValue($old, $fieldKey);
+                        }
+
+                        $payload[] = $row;
+
+                        if (count($payload) >= $chunkSize) {
+                            $targetDb->table('trn_inventory_transaction_file1')->insert($payload);
+                            $inventoryFile1Rows += count($payload);
+                            $payload = [];
+                        }
+                    }
+
+                    if ($payload !== []) {
+                        $targetDb->table('trn_inventory_transaction_file1')->insert($payload);
+                        $inventoryFile1Rows += count($payload);
+                    }
+                } else {
+                    $inventoryFile1SourceMissing = true;
+                    $this->noteMissingSourceTable('inventorytranfile1', $source, $target, $conversionNotes, 'inventory_transaction');
+                }
+
+                // 3. inventorytranfile2 → trn_inventory_transaction_file2
+                if ($this->sourceTableExists($sourceDb, 'inventorytranfile2')) {
+                    $validItemIds = $targetDb->table('mf_items')->pluck('item_id')->flip()->all();
+                    $payload = [];
+
+                    foreach ($sourceDb->table('inventorytranfile2')->orderBy('recid')->lazy($chunkSize) as $old) {
+                        $documentNumber = trim((string) ($this->optionalRowValue($old, 'docnum') ?? ''));
+                        $transactionTypeId = trim((string) ($this->optionalRowValue($old, 'trntypcde') ?? ''));
+                        $itemId = trim((string) ($this->optionalRowValue($old, 'itmcde') ?? ''));
+
+                        if ($documentNumber === '') {
+                            $skippedInventoryFile2Rows++;
+
+                            continue;
+                        }
+
+                        // if ($itemId === '' || ! isset($validItemIds[$itemId])) {
+                        //     $skippedInventoryFile2Rows++;
+                        //     $note = "Skipped inventory transaction detail for \"{$documentNumber}\": item_id \"{$itemId}\" not found in mf_items.";
+                        //     $conversionNotes[] = $note;
+                        //     Log::warning($note, [
+                        //         'conversion' => 'inventory_transaction',
+                        //         'document_number' => $documentNumber,
+                        //         'item_id' => $itemId,
+                        //         'source_database' => $source->database,
+                        //         'target_database' => $target->database,
+                        //     ]);
+
+                        //     continue;
+                        // }
+
+                        if ($transactionTypeId === '' || ! isset($validTransactionTypeIds[$transactionTypeId])) {
+                            $skippedInventoryFile2Rows++;
+                            $note = "Skipped inventory transaction detail for \"{$documentNumber}\": transaction_type_id \"{$transactionTypeId}\" not found in mf_inventory_transactiontypes.";
+                            $conversionNotes[] = $note;
+                            Log::warning($note, [
+                                'conversion' => 'inventory_transaction',
+                                'document_number' => $documentNumber,
+                                'transaction_type_id' => $transactionTypeId,
+                                'source_database' => $source->database,
+                                'target_database' => $target->database,
+                            ]);
+
+                            continue;
+                        }
+
+                        [$branchId, $branchNullified] = $this->resolveInventoryBranchId(
+                            $sourceDb,
+                            $targetDb,
+                            $this->optionalRowValue($old, 'brhcde'),
+                            $now,
+                            $validBranchIds,
+                            $ensuredBranchIds,
+                            $conversionNotes,
+                            "inventory transaction detail \"{$documentNumber}\" / \"{$itemId}\"",
+                        );
+                        if ($branchNullified) {
+                            $nullifiedInventoryBranches++;
+                        }
+
+                        $row = [
+                            'detail_type' => $this->optionalRowValue($old, 'dettyp'),
+                            'document_number' => $documentNumber,
+                            'item_id' => $itemId,
+                            'item_quantity' => $this->optionalRowValue($old, 'itmqty'),
+                            'transaction_code' => $this->optionalRowValue($old, 'trncde'),
+                            'unit_of_measure' => $this->optionalRowValue($old, 'untmea'),
+                            'factor' => $this->optionalRowValue($old, 'factor'),
+                            'warehouse_id' => $this->optionalRowValue($old, 'warcde'),
+                            'warehouse_id2' => $this->optionalRowValue($old, 'warcde2'),
+                            'line_number' => $this->optionalRowValue($old, 'linenum'),
+                            'unit_price' => $this->optionalRowValue($old, 'untprc'),
+                            'extended_price' => $this->optionalRowValue($old, 'extprc'),
+                            'log_time' => $this->optionalRowValue($old, 'logtim'),
+                            'user_id' => $this->optionalRowValue($old, 'usrnam'),
+                            'transaction_type_id' => $transactionTypeId,
+                            'item_type' => $this->optionalRowValue($old, 'itmtyp'),
+                            'item_remarks1' => $this->optionalRowValue($old, 'itmrem1'),
+                            'item_remarks2' => $this->optionalRowValue($old, 'itmrem2'),
+                            'item_remarks3' => $this->optionalRowValue($old, 'itmrem3'),
+                            'transaction_date' => $this->optionalRowValue($old, 'trndte'),
+                            'log_date' => $this->optionalRowValue($old, 'logdte'),
+                            'barcode_number' => $this->optionalRowValue($old, 'barcodenum'),
+                            'branch_id' => $branchId,
+                            'barcode' => $this->optionalRowValue($old, 'barcde'),
+                            'batch_number' => $this->optionalRowValue($old, 'batchnum'),
+                            'manufacturing_date' => $this->optionalRowValue($old, 'mfgdte'),
+                            'expiration_date' => $this->optionalRowValue($old, 'expdte'),
+                            'copy_line_number' => $this->optionalRowValue($old, 'copyline'),
+                            'deliver_status' => $this->optionalRowValue($old, 'delsta'),
+                            'item_delivered' => $this->optionalRowValue($old, 'itmdel'),
+                            'so_document_number' => $this->optionalRowValue($old, 'sonum'),
+                            'warehouse_number' => 'MAIN',
+                            'warehouse_location_id' => 'LSTVDEFAULTWHSLOCATION1',
+                            'bin_number' => 'MAIN',
+                            'created_at' => $now,
+                            'updated_at' => $now,
+                        ];
+
+                        for ($fieldIndex = 1; $fieldIndex <= 20; $fieldIndex++) {
+                            $fieldKey = sprintf('field%02d', $fieldIndex);
+                            $row[$fieldKey] = $this->optionalRowValue($old, $fieldKey);
+                        }
+
+                        $payload[] = $row;
+
+                        if (count($payload) >= $chunkSize) {
+                            $targetDb->table('trn_inventory_transaction_file2')->insert($payload);
+                            $inventoryFile2Rows += count($payload);
+                            $payload = [];
+                        }
+                    }
+
+                    if ($payload !== []) {
+                        $targetDb->table('trn_inventory_transaction_file2')->insert($payload);
+                        $inventoryFile2Rows += count($payload);
+                    }
+                } else {
+                    $inventoryFile2SourceMissing = true;
+                    $this->noteMissingSourceTable('inventorytranfile2', $source, $target, $conversionNotes, 'inventory_transaction');
+                }
+
+                $totalRows += $transactionTypeRows + $inventoryFile1Rows + $inventoryFile2Rows;
+
+                $transferredTables[] = $transactionTypeSourceMissing
+                    ? 'trantypefile → mf_inventory_transactiontypes (skipped, source table not found)'
+                    : "trantypefile → mf_inventory_transactiontypes ({$transactionTypeRows} row(s))";
+
+                $inventoryFile1Summary = $inventoryFile1SourceMissing
+                    ? 'inventorytranfile1 → trn_inventory_transaction_file1 (skipped, source table not found)'
+                    : "inventorytranfile1 → trn_inventory_transaction_file1 ({$inventoryFile1Rows} row(s))";
+                if ($skippedInventoryFile1Rows > 0) {
+                    $inventoryFile1Summary .= ", {$skippedInventoryFile1Rows} skipped";
+                }
+                if ($nullifiedInventoryBranches > 0) {
+                    $inventoryFile1Summary .= ", {$nullifiedInventoryBranches} invalid branch(es) set to null";
+                }
+                $transferredTables[] = $inventoryFile1Summary;
+
+                $inventoryFile2Summary = $inventoryFile2SourceMissing
+                    ? 'inventorytranfile2 → trn_inventory_transaction_file2 (skipped, source table not found)'
+                    : "inventorytranfile2 → trn_inventory_transaction_file2 ({$inventoryFile2Rows} row(s))";
+                if ($skippedInventoryFile2Rows > 0) {
+                    $inventoryFile2Summary .= ", {$skippedInventoryFile2Rows} skipped";
+                }
+                $transferredTables[] = $inventoryFile2Summary;
+            }
+            #endregion
+
+            #region Physical Count Conversion
+            if ($physicalCount) {
+                $chunkSize = 500;
+                $companyId = trim((string) $request->input('company_name', ''));
+                $ensuredBranchIds = [];
+                $validUserIds = $targetDb->table('users')->pluck('user_id')->flip()->all();
+                $ensuredUserIds = [];
+                $createdPhysicalCountUsers = 0;
+                $nullifiedPhysicalCountUsers = 0;
+                $physicalCountFile1Rows = 0;
+                $physicalCountFile3Rows = 0;
+                $physicalCountFile31Rows = 0;
+                $physicalCountFile2Rows = 0;
+                $skippedPhysicalCountFile1Rows = 0;
+                $skippedPhysicalCountFile3Rows = 0;
+                $skippedPhysicalCountFile31Rows = 0;
+                $skippedPhysicalCountFile2Rows = 0;
+                $nullifiedPhysicalCountBranches = 0;
+                $physicalCountFile1SourceMissing = false;
+                $physicalCountFile3SourceMissing = false;
+                $physicalCountFile31SourceMissing = false;
+                $physicalCountFile2SourceMissing = false;
+
+                $hasPhysicalCountSource = $this->sourceTableExists($sourceDb, 'physicalcountfile1')
+                    || $this->sourceTableExists($sourceDb, 'physicalcountfile2')
+                    || $this->sourceTableExists($sourceDb, 'physicalcountfile3')
+                    || $this->sourceTableExists($sourceDb, 'physicalcountfile31');
+
+                if ($hasPhysicalCountSource) {
+                    $targetDb->statement('SET FOREIGN_KEY_CHECKS = 0');
+                    $targetDb->table('trn_physical_count_file2')->delete();
+                    $targetDb->table('trn_physical_count_file31')->delete();
+                    $targetDb->table('trn_physical_count_file3')->delete();
+                    $targetDb->table('trn_physical_count_file1')->delete();
+                    $targetDb->statement('SET FOREIGN_KEY_CHECKS = 1');
+                }
+
+                $validBranchIds = $targetDb->table('mf_branch')->pluck('branch_id')->flip()->all();
+                $validItemIds = $targetDb->table('mf_items')->pluck('item_id')->flip()->all();
+                $warehouseDefaults = [
+                    'warehouse_number' => 'MAIN',
+                    'warehouse_location_id' => 'LSTVDEFAULTWHSLOCATION1',
+                    'bin_number' => 'MAIN',
+                ];
+
+                // 1. physicalcountfile1 → trn_physical_count_file1
+                if ($this->sourceTableExists($sourceDb, 'physicalcountfile1')) {
+                    $payload = [];
+
+                    foreach ($sourceDb->table('physicalcountfile1')->orderBy('recid')->lazy($chunkSize) as $old) {
+                        $documentNumber = trim((string) ($this->optionalRowValue($old, 'docnum') ?? ''));
+                        if ($documentNumber === '') {
+                            $skippedPhysicalCountFile1Rows++;
+
+                            continue;
+                        }
+
+                        [$branchId, $branchNullified] = $this->resolveInventoryBranchId(
+                            $sourceDb,
+                            $targetDb,
+                            $this->optionalRowValue($old, 'brhcde'),
+                            $now,
+                            $validBranchIds,
+                            $ensuredBranchIds,
+                            $conversionNotes,
+                            "physical count header \"{$documentNumber}\"",
+                        );
+                        if ($branchNullified) {
+                            $nullifiedPhysicalCountBranches++;
+                        }
+
+                        $rawUserId = trim((string) ($this->optionalRowValue($old, 'usrnam') ?? ''));
+                        [$resolvedUserId, $userWasCreated] = $this->ensureUserExistsFromSource(
+                            $sourceDb,
+                            $targetDb,
+                            $rawUserId,
+                            $now,
+                            $companyId,
+                            $validUserIds,
+                            $ensuredUserIds,
+                            $validBranchIds,
+                            $ensuredBranchIds,
+                            $conversionNotes,
+                            "physical count header \"{$documentNumber}\"",
+                        );
+                        if ($userWasCreated) {
+                            $createdPhysicalCountUsers++;
+                        }
+                        if ($rawUserId !== '' && $resolvedUserId === null) {
+                            $nullifiedPhysicalCountUsers++;
+                        }
+
+                        $payload[] = [
+                            'document_number' => $documentNumber,
+                            'disable_inv_gain_loss' => $this->optionalRowValue($old, 'disinvgl'),
+                            'transaction_date' => $this->optionalRowValue($old, 'trndte'),
+                            'transaction_code' => $this->optionalRowValue($old, 'trncde'),
+                            'transaction_type_code' => $this->optionalRowValue($old, 'trntypcde'),
+                            'remarks' => $this->optionalRowValue($old, 'remarks'),
+                            'warehouse_id' => $this->optionalRowValue($old, 'warcde'),
+                            'branch_id' => $branchId,
+                            'gl_department_id' => $this->optionalRowValue($old, 'gldepcde'),
+                            'user_id' => $resolvedUserId,
+                            'log_date' => $this->optionalRowValue($old, 'logdte'),
+                            'log_time' => $this->optionalRowValue($old, 'logtim'),
+                            'status' => $this->optionalRowValue($old, 'status'),
+                            'document_lock' => $this->optionalRowValue($old, 'doclock'),
+                            'created_at' => $now,
+                            'updated_at' => $now,
+                        ];
+
+                        if (count($payload) >= $chunkSize) {
+                            $targetDb->table('trn_physical_count_file1')->insert($payload);
+                            $physicalCountFile1Rows += count($payload);
+                            $payload = [];
+                        }
+                    }
+
+                    if ($payload !== []) {
+                        $targetDb->table('trn_physical_count_file1')->insert($payload);
+                        $physicalCountFile1Rows += count($payload);
+                    }
+                } else {
+                    $physicalCountFile1SourceMissing = true;
+                    $this->noteMissingSourceTable('physicalcountfile1', $source, $target, $conversionNotes, 'physical_count');
+                }
+
+                // 2. physicalcountfile3 → trn_physical_count_file3
+                if ($this->sourceTableExists($sourceDb, 'physicalcountfile3')) {
+                    $payload = [];
+
+                    foreach ($sourceDb->table('physicalcountfile3')->orderBy('recid')->lazy($chunkSize) as $old) {
+                        $documentNumber = trim((string) ($this->optionalRowValue($old, 'docnum') ?? ''));
+                        $itemId = trim((string) ($this->optionalRowValue($old, 'itmcde') ?? ''));
+
+                        if ($documentNumber === '') {
+                            $skippedPhysicalCountFile3Rows++;
+
+                            continue;
+                        }
+
+                        if ($itemId === '' || ! isset($validItemIds[$itemId])) {
+                            $skippedPhysicalCountFile3Rows++;
+                            $note = "Skipped physical count line (file3) for \"{$documentNumber}\": item_id \"{$itemId}\" not found in mf_items.";
+                            $conversionNotes[] = $note;
+                            Log::warning($note, [
+                                'conversion' => 'physical_count',
+                                'document_number' => $documentNumber,
+                                'item_id' => $itemId,
+                                'source_database' => $source->database,
+                                'target_database' => $target->database,
+                            ]);
+
+                            continue;
+                        }
+
+                        [$branchId, $branchNullified] = $this->resolveInventoryBranchId(
+                            $sourceDb,
+                            $targetDb,
+                            $this->optionalRowValue($old, 'brhcde'),
+                            $now,
+                            $validBranchIds,
+                            $ensuredBranchIds,
+                            $conversionNotes,
+                            "physical count line (file3) \"{$documentNumber}\" / \"{$itemId}\"",
+                        );
+                        if ($branchNullified) {
+                            $nullifiedPhysicalCountBranches++;
+                        }
+
+                        $rawUserId = trim((string) ($this->optionalRowValue($old, 'usrnam') ?? ''));
+                        [$resolvedUserId, $userWasCreated] = $this->ensureUserExistsFromSource(
+                            $sourceDb,
+                            $targetDb,
+                            $rawUserId,
+                            $now,
+                            $companyId,
+                            $validUserIds,
+                            $ensuredUserIds,
+                            $validBranchIds,
+                            $ensuredBranchIds,
+                            $conversionNotes,
+                            "physical count line (file3) \"{$documentNumber}\" / \"{$itemId}\"",
+                        );
+                        if ($userWasCreated) {
+                            $createdPhysicalCountUsers++;
+                        }
+                        if ($rawUserId !== '' && $resolvedUserId === null) {
+                            $nullifiedPhysicalCountUsers++;
+                        }
+
+                        $payload[] = array_merge([
+                            'reference_number' => $this->optionalRowValue($old, 'refnum'),
+                            'document_number' => $documentNumber,
+                            'item_id' => $itemId,
+                            'item_quantity' => $this->optionalRowValue($old, 'itmqty'),
+                            'transaction_code' => $this->optionalRowValue($old, 'trncde'),
+                            'unit_of_measure' => $this->optionalRowValue($old, 'untmea'),
+                            'factor' => $this->optionalRowValue($old, 'factor'),
+                            'warehouse_id' => $this->optionalRowValue($old, 'warcde'),
+                            'unit_price' => $this->optionalRowValue($old, 'untprc'),
+                            'extended_price' => $this->optionalRowValue($old, 'extprc'),
+                            'gross_price' => $this->optionalRowValue($old, 'groprc'),
+                            'user_id' => $resolvedUserId,
+                            'string_item_quantity' => $this->optionalRowValue($old, 'stritmqty'),
+                            'pstr_item_quantity' => $this->optionalRowValue($old, 'pstritmqty'),
+                            'line_number' => $this->optionalRowValue($old, 'linenum'),
+                            'log_time' => $this->optionalRowValue($old, 'logtim'),
+                            'transaction_date' => $this->optionalRowValue($old, 'trndte'),
+                            'log_date' => $this->optionalRowValue($old, 'logdte'),
+                            'item_type' => $this->optionalRowValue($old, 'itmtyp'),
+                            'branch_id' => $branchId,
+                            'tag_number' => $this->optionalRowValue($old, 'tagnum'),
+                            'created_at' => $now,
+                            'updated_at' => $now,
+                        ], $warehouseDefaults);
+
+                        if (count($payload) >= $chunkSize) {
+                            $targetDb->table('trn_physical_count_file3')->insert($payload);
+                            $physicalCountFile3Rows += count($payload);
+                            $payload = [];
+                        }
+                    }
+
+                    if ($payload !== []) {
+                        $targetDb->table('trn_physical_count_file3')->insert($payload);
+                        $physicalCountFile3Rows += count($payload);
+                    }
+                } else {
+                    $physicalCountFile3SourceMissing = true;
+                    $this->noteMissingSourceTable('physicalcountfile3', $source, $target, $conversionNotes, 'physical_count');
+                }
+
+                // 3. physicalcountfile31 → trn_physical_count_file31
+                if ($this->sourceTableExists($sourceDb, 'physicalcountfile31')) {
+                    $payload = [];
+
+                    foreach ($sourceDb->table('physicalcountfile31')->orderBy('recid')->lazy($chunkSize) as $old) {
+                        $documentNumber = trim((string) ($this->optionalRowValue($old, 'docnum') ?? ''));
+                        if ($documentNumber === '') {
+                            $skippedPhysicalCountFile31Rows++;
+
+                            continue;
+                        }
+
+                        [$branchId, $branchNullified] = $this->resolveInventoryBranchId(
+                            $sourceDb,
+                            $targetDb,
+                            $this->optionalRowValue($old, 'brhcde'),
+                            $now,
+                            $validBranchIds,
+                            $ensuredBranchIds,
+                            $conversionNotes,
+                            "physical count sub-header \"{$documentNumber}\"",
+                        );
+                        if ($branchNullified) {
+                            $nullifiedPhysicalCountBranches++;
+                        }
+
+                        $rawUserId = trim((string) ($this->optionalRowValue($old, 'usrnam') ?? ''));
+                        [$resolvedUserId, $userWasCreated] = $this->ensureUserExistsFromSource(
+                            $sourceDb,
+                            $targetDb,
+                            $rawUserId,
+                            $now,
+                            $companyId,
+                            $validUserIds,
+                            $ensuredUserIds,
+                            $validBranchIds,
+                            $ensuredBranchIds,
+                            $conversionNotes,
+                            "physical count sub-header \"{$documentNumber}\"",
+                        );
+                        if ($userWasCreated) {
+                            $createdPhysicalCountUsers++;
+                        }
+                        if ($rawUserId !== '' && $resolvedUserId === null) {
+                            $nullifiedPhysicalCountUsers++;
+                        }
+
+                        $payload[] = [
+                            'reference_number' => $this->optionalRowValue($old, 'refnum'),
+                            'document_number' => $documentNumber,
+                            'remarks' => $this->optionalRowValue($old, 'remarks'),
+                            'user_id' => $resolvedUserId,
+                            'document_lock' => $this->optionalRowValue($old, 'doclock'),
+                            'warehouse_id' => $this->optionalRowValue($old, 'warcde'),
+                            'branch_id' => $branchId,
+                            'transaction_code' => $this->optionalRowValue($old, 'trncde'),
+                            'transaction_date' => $this->optionalRowValue($old, 'trndte'),
+                            'transaction_total' => $this->optionalRowValue($old, 'trntot'),
+                            'log_date' => $this->optionalRowValue($old, 'logdte'),
+                            'log_time' => $this->optionalRowValue($old, 'logtim'),
+                            'created_at' => $now,
+                            'updated_at' => $now,
+                        ];
+
+                        if (count($payload) >= $chunkSize) {
+                            $targetDb->table('trn_physical_count_file31')->insert($payload);
+                            $physicalCountFile31Rows += count($payload);
+                            $payload = [];
+                        }
+                    }
+
+                    if ($payload !== []) {
+                        $targetDb->table('trn_physical_count_file31')->insert($payload);
+                        $physicalCountFile31Rows += count($payload);
+                    }
+                } else {
+                    $physicalCountFile31SourceMissing = true;
+                    $this->noteMissingSourceTable('physicalcountfile31', $source, $target, $conversionNotes, 'physical_count');
+                }
+
+                // 4. physicalcountfile2 → trn_physical_count_file2
+                if ($this->sourceTableExists($sourceDb, 'physicalcountfile2')) {
+                    $payload = [];
+
+                    foreach ($sourceDb->table('physicalcountfile2')->orderBy('recid')->lazy($chunkSize) as $old) {
+                        $documentNumber = trim((string) ($this->optionalRowValue($old, 'docnum') ?? ''));
+                        $itemId = trim((string) ($this->optionalRowValue($old, 'itmcde') ?? ''));
+
+                        if ($documentNumber === '') {
+                            $skippedPhysicalCountFile2Rows++;
+
+                            continue;
+                        }
+
+                        if ($itemId === '' || ! isset($validItemIds[$itemId])) {
+                            $skippedPhysicalCountFile2Rows++;
+                            $note = "Skipped physical count line (file2) for \"{$documentNumber}\": item_id \"{$itemId}\" not found in mf_items.";
+                            $conversionNotes[] = $note;
+                            Log::warning($note, [
+                                'conversion' => 'physical_count',
+                                'document_number' => $documentNumber,
+                                'item_id' => $itemId,
+                                'source_database' => $source->database,
+                                'target_database' => $target->database,
+                            ]);
+
+                            continue;
+                        }
+
+                        $rawUserId = trim((string) ($this->optionalRowValue($old, 'usrnam') ?? ''));
+                        [$resolvedUserId, $userWasCreated] = $this->ensureUserExistsFromSource(
+                            $sourceDb,
+                            $targetDb,
+                            $rawUserId,
+                            $now,
+                            $companyId,
+                            $validUserIds,
+                            $ensuredUserIds,
+                            $validBranchIds,
+                            $ensuredBranchIds,
+                            $conversionNotes,
+                            "physical count line (file2) \"{$documentNumber}\" / \"{$itemId}\"",
+                        );
+                        if ($userWasCreated) {
+                            $createdPhysicalCountUsers++;
+                        }
+                        if ($rawUserId !== '' && $resolvedUserId === null) {
+                            $nullifiedPhysicalCountUsers++;
+                        }
+
+                        $payload[] = array_merge([
+                            'document_number' => $documentNumber,
+                            'item_id' => $itemId,
+                            'transaction_code' => $this->optionalRowValue($old, 'trncde'),
+                            'unit_of_measure' => $this->optionalRowValue($old, 'untmea'),
+                            'warehouse_id' => $this->optionalRowValue($old, 'warcde'),
+                            'line_number' => $this->optionalRowValue($old, 'linenum'),
+                            'tag_number' => $this->optionalRowValue($old, 'tagnum'),
+                            'gross_price' => $this->optionalRowValue($old, 'groprc'),
+                            'unit_price' => $this->optionalRowValue($old, 'untprc'),
+                            'item_quantity' => $this->optionalRowValue($old, 'itmqty'),
+                            'extended_price' => $this->optionalRowValue($old, 'extprc'),
+                            'log_time' => $this->optionalRowValue($old, 'logtim'),
+                            'user_id' => $resolvedUserId,
+                            'string_item_quantity' => $this->optionalRowValue($old, 'stritmqty'),
+                            'pstr_item_quantity' => $this->optionalRowValue($old, 'pstritmqty'),
+                            'item_type' => $this->optionalRowValue($old, 'itmtyp'),
+                            'item_remarks1' => $this->optionalRowValue($old, 'itmrem1'),
+                            'item_remarks2' => $this->optionalRowValue($old, 'itmrem2'),
+                            'item_remarks3' => $this->optionalRowValue($old, 'itmrem3'),
+                            'transaction_date' => $this->optionalRowValue($old, 'trndte'),
+                            'log_date' => $this->optionalRowValue($old, 'logdte'),
+                            'factor' => $this->optionalRowValue($old, 'factor'),
+                            'created_at' => $now,
+                            'updated_at' => $now,
+                        ], $warehouseDefaults);
+
+                        if (count($payload) >= $chunkSize) {
+                            $targetDb->table('trn_physical_count_file2')->insert($payload);
+                            $physicalCountFile2Rows += count($payload);
+                            $payload = [];
+                        }
+                    }
+
+                    if ($payload !== []) {
+                        $targetDb->table('trn_physical_count_file2')->insert($payload);
+                        $physicalCountFile2Rows += count($payload);
+                    }
+                } else {
+                    $physicalCountFile2SourceMissing = true;
+                    $this->noteMissingSourceTable('physicalcountfile2', $source, $target, $conversionNotes, 'physical_count');
+                }
+
+                $totalRows += $physicalCountFile1Rows + $physicalCountFile3Rows + $physicalCountFile31Rows + $physicalCountFile2Rows;
+
+                $physicalCountFile1Summary = $physicalCountFile1SourceMissing
+                    ? 'physicalcountfile1 → trn_physical_count_file1 (skipped, source table not found)'
+                    : "physicalcountfile1 → trn_physical_count_file1 ({$physicalCountFile1Rows} row(s))";
+                if ($skippedPhysicalCountFile1Rows > 0) {
+                    $physicalCountFile1Summary .= ", {$skippedPhysicalCountFile1Rows} skipped";
+                }
+                if ($nullifiedPhysicalCountBranches > 0) {
+                    $physicalCountFile1Summary .= ", {$nullifiedPhysicalCountBranches} invalid branch(es) set to null";
+                }
+                if ($createdPhysicalCountUsers > 0) {
+                    $physicalCountFile1Summary .= ", {$createdPhysicalCountUsers} user(s) auto-created in users";
+                }
+                if ($nullifiedPhysicalCountUsers > 0) {
+                    $physicalCountFile1Summary .= ", {$nullifiedPhysicalCountUsers} user_id(s) set to null";
+                }
+                $transferredTables[] = $physicalCountFile1Summary;
+
+                $physicalCountFile3Summary = $physicalCountFile3SourceMissing
+                    ? 'physicalcountfile3 → trn_physical_count_file3 (skipped, source table not found)'
+                    : "physicalcountfile3 → trn_physical_count_file3 ({$physicalCountFile3Rows} row(s))";
+                if ($skippedPhysicalCountFile3Rows > 0) {
+                    $physicalCountFile3Summary .= ", {$skippedPhysicalCountFile3Rows} skipped";
+                }
+                $transferredTables[] = $physicalCountFile3Summary;
+
+                $transferredTables[] = $physicalCountFile31SourceMissing
+                    ? 'physicalcountfile31 → trn_physical_count_file31 (skipped, source table not found)'
+                    : "physicalcountfile31 → trn_physical_count_file31 ({$physicalCountFile31Rows} row(s))".($skippedPhysicalCountFile31Rows > 0 ? ", {$skippedPhysicalCountFile31Rows} skipped" : '');
+
+                $physicalCountFile2Summary = $physicalCountFile2SourceMissing
+                    ? 'physicalcountfile2 → trn_physical_count_file2 (skipped, source table not found)'
+                    : "physicalcountfile2 → trn_physical_count_file2 ({$physicalCountFile2Rows} row(s))";
+                if ($skippedPhysicalCountFile2Rows > 0) {
+                    $physicalCountFile2Summary .= ", {$skippedPhysicalCountFile2Rows} skipped";
+                }
+                $transferredTables[] = $physicalCountFile2Summary;
+            }
+            #endregion
+
             if ($totalRows === 0) {
                 throw new RuntimeException('No rows were transferred.');
             }
@@ -2438,6 +3223,163 @@ class DataTransferController extends Controller
         Log::warning($note);
     }
 
+    /**
+     * @param  array<string, true>  $validBranchIds
+     * @param  array<string, true>  $ensuredBranchIds
+     * @param  list<string>  $conversionNotes
+     * @return array{0: ?string, 1: bool}
+     */
+    protected function resolveInventoryBranchId(
+        mixed $sourceDb,
+        mixed $targetDb,
+        mixed $branchId,
+        mixed $now,
+        array &$validBranchIds,
+        array &$ensuredBranchIds,
+        array &$conversionNotes,
+        string $contextLabel,
+    ): array {
+        $branchId = trim((string) ($branchId ?? ''));
+        if ($branchId === '') {
+            return [null, false];
+        }
+
+        if (! isset($validBranchIds[$branchId])) {
+            $this->ensureBranchExists($sourceDb, $targetDb, $branchId, $now, $ensuredBranchIds, $conversionNotes);
+
+            if ($targetDb->table('mf_branch')->where('branch_id', $branchId)->exists()) {
+                $validBranchIds[$branchId] = true;
+            }
+        }
+
+        if (! isset($validBranchIds[$branchId])) {
+            $note = "Set branch_id to null for {$contextLabel}: branch \"{$branchId}\" not found in mf_branch.";
+            $conversionNotes[] = $note;
+            Log::warning($note, [
+                'conversion' => 'inventory_transaction',
+                'branch_id' => $branchId,
+            ]);
+
+            return [null, true];
+        }
+
+        return [$branchId, false];
+    }
+
+    /**
+     * @param  array<string, true>  $validUserIds
+     * @param  array<string, true>  $ensuredUserIds
+     * @param  array<string, true>  $validBranchIds
+     * @param  array<string, true>  $ensuredBranchIds
+     * @param  list<string>  $conversionNotes
+     * @return array{0: ?string, 1: bool}
+     */
+    protected function ensureUserExistsFromSource(
+        mixed $sourceDb,
+        mixed $targetDb,
+        mixed $userId,
+        mixed $now,
+        string $defaultFirstName,
+        array &$validUserIds,
+        array &$ensuredUserIds,
+        array &$validBranchIds,
+        array &$ensuredBranchIds,
+        array &$conversionNotes,
+        string $contextLabel,
+        string $conversion = 'physical_count',
+    ): array {
+        $userId = trim((string) ($userId ?? ''));
+        if ($userId === '') {
+            return [null, false];
+        }
+
+        if (isset($validUserIds[$userId])) {
+            return [$userId, false];
+        }
+
+        if (isset($ensuredUserIds[$userId])) {
+            return [null, false];
+        }
+
+        $ensuredUserIds[$userId] = true;
+
+        if ($targetDb->table('users')->where('user_id', $userId)->exists()) {
+            $validUserIds[$userId] = true;
+
+            return [$userId, false];
+        }
+
+        if (! $this->sourceTableExists($sourceDb, 'users')) {
+            $note = "Set user_id to null for {$contextLabel}: user \"{$userId}\" not in target users and source users table not found.";
+            $conversionNotes[] = $note;
+            Log::warning($note, [
+                'conversion' => $conversion,
+                'user_id' => $userId,
+            ]);
+
+            return [null, false];
+        }
+
+        $old = $sourceDb->table('users')->where('usrcde', $userId)->first();
+        if ($old === null) {
+            $note = "Set user_id to null for {$contextLabel}: user \"{$userId}\" not found in source users table.";
+            $conversionNotes[] = $note;
+            Log::warning($note, [
+                'conversion' => $conversion,
+                'user_id' => $userId,
+            ]);
+
+            return [null, false];
+        }
+
+        $lastBranch = trim((string) ($old->lastbrnch ?? ''));
+        $lastUsedBranchId = null;
+        if ($lastBranch !== '') {
+            if (! isset($validBranchIds[$lastBranch])) {
+                $this->ensureBranchExists($sourceDb, $targetDb, $lastBranch, $now, $ensuredBranchIds, $conversionNotes);
+
+                if ($targetDb->table('mf_branch')->where('branch_id', $lastBranch)->exists()) {
+                    $validBranchIds[$lastBranch] = true;
+                }
+            }
+
+            if (isset($validBranchIds[$lastBranch])) {
+                $lastUsedBranchId = $lastBranch;
+            }
+        }
+
+        $userType = trim((string) ($this->optionalRowValue($old, 'usrlvl') ?? ''));
+        $userType = $userType === '' ? 'User' : $userType;
+        $firstName = $defaultFirstName !== '' ? $defaultFirstName : $userId;
+
+        $targetDb->table('users')->upsert(
+            [[
+                'user_id' => $userId,
+                'username' => $userId,
+                'last_name' => $userId,
+                'password' => $this->optionalRowValue($old, 'usrpwd'),
+                'user_type' => $userType,
+                'first_name' => $firstName,
+                'last_used_branch_id' => $lastUsedBranchId,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ]],
+            ['user_id'],
+            ['username', 'last_name', 'password', 'user_type', 'first_name', 'last_used_branch_id', 'updated_at'],
+        );
+
+        $validUserIds[$userId] = true;
+
+        $note = "Auto-created user \"{$userId}\" in users table from source users for {$contextLabel}.";
+        $conversionNotes[] = $note;
+        Log::info($note, [
+            'conversion' => $conversion,
+            'user_id' => $userId,
+        ]);
+
+        return [$userId, true];
+    }
+
     protected function sourceTableExists(mixed $db, string $table): bool
     {
         try {
@@ -2447,12 +3389,17 @@ class DataTransferController extends Controller
         }
     }
 
-    protected function noteMissingSourceTable(string $sourceTable,RemoteDatabaseConfig $source,RemoteDatabaseConfig $target,array &$conversionNotes): void
-    {
+    protected function noteMissingSourceTable(
+        string $sourceTable,
+        RemoteDatabaseConfig $source,
+        RemoteDatabaseConfig $target,
+        array &$conversionNotes,
+        string $conversion = 'user_file',
+    ): void {
         $note = "Skipped conversion for \"{$sourceTable}\": source table not found in {$source->database}. Target data was left unchanged.";
         $conversionNotes[] = $note;
         Log::warning($note, [
-            'conversion' => 'user_file',
+            'conversion' => $conversion,
             'source_table' => $sourceTable,
             'source_database' => $source->database,
             'target_database' => $target->database,
@@ -2485,6 +3432,27 @@ class DataTransferController extends Controller
         $targetDb->table($table)->upsert($payload, $uniqueBy, $updateColumns);
 
         return count($payload);
+    }
+
+    /**
+     * @param  array<string, true|int>  $validIds
+     */
+    protected function resolveForeignKeyId(mixed $value, array $validIds, ?int &$nullifiedCount = null): ?string
+    {
+        $id = trim((string) ($value ?? ''));
+        if ($id === '') {
+            return null;
+        }
+
+        if (isset($validIds[$id])) {
+            return $id;
+        }
+
+        if ($nullifiedCount !== null) {
+            $nullifiedCount++;
+        }
+
+        return null;
     }
 
     protected function optionalRowValue(mixed $row, string $property, mixed $default = null): mixed
