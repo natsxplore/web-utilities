@@ -236,7 +236,11 @@ export function initTransferWizard() {
             return;
         }
         if ($('#company_file').is(':checked') && !$('#company_name').val().trim()) {
-            Swal.fire('Missing', 'Enter Company Name for Company file conversion.', 'warning');
+            Swal.fire('Missing', 'Enter Company ID for Company file conversion.', 'warning');
+            return;
+        }
+        if ($('#user_file').is(':checked') && !$('#company_name').val().trim()) {
+            Swal.fire('Missing', 'Enter Company ID for User file conversion (used as users.first_name).', 'warning');
             return;
         }
 

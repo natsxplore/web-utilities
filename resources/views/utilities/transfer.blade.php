@@ -139,10 +139,10 @@
                     </div>
 
                     <div class="max-w-md">
-                        <label class="mb-1 block text-sm font-medium text-zinc-900" for="company_id">Company Name</label>
+                        <label class="mb-1 block text-sm font-medium text-zinc-900" for="company_name">Company ID</label>
                         <input type="text" id="company_name" name="company_name"
                                class="w-full rounded-md border border-zinc-300 px-3 py-2 text-sm font-mono focus:border-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-500"
-                               placeholder="Type company name manually">
+                               placeholder="Enter company ID manually (company file + users first_name)">
                     </div>
 
                     <div class="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
@@ -158,7 +158,7 @@
                             ['id' => 'company_file', 'label' => 'Company file', 'hint' => 'companyfile → companyfile'],
                             ['id' => 'system_parameter', 'label' => 'System Parameter', 'hint' => 'syspar → sys_setup'],
                             ['id' => 'branch', 'label' => 'Branch', 'hint' => 'branchfile → mf_branch'],
-                            ['id' => 'user_file', 'label' => 'User File', 'hint' => 'userfile → users'],
+                            ['id' => 'user_file', 'label' => 'User File', 'hint' => 'pos_userfile → mf_pos_users + users'],
                             ['id' => 'currency', 'label' => 'Currency', 'hint' => 'currencyfile → currency_file'],
                             ['id' => 'tax_code', 'label' => 'Tax Code', 'hint' => null],
                             ['id' => 'item_classification', 'label' => 'Item Classification', 'hint' => null],

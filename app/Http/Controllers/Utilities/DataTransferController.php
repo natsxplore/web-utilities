@@ -127,6 +127,9 @@ class DataTransferController extends Controller
                         'company_address1' => $old->companyadd1,
                         'company_address2' => $old->companyadd2,
                         'branch_id' => $old->brhcde,
+                        'business1' => $old->business1,
+                        'business2' => $old->business2,
+                        'business3' => $old->business3,
                         'address1' => $old->address1,
                         'address2' => $old->address2,
                         'address3' => $old->address3,
@@ -191,10 +194,9 @@ class DataTransferController extends Controller
                     'chk_cus_search' => $old->chkcussearch,
                     'chk_sup_search' => $old->chksupsearch,
                     'visible_barcode' => $old->chkbarcode,
-                    'console_file_sync' => $old->consofilesync,
+                    'console_file_sync' => $old->consofilesync ?? 1,
                     'critical_level_type' => $old->crilvltyp,
                     'chk_inv_print' => $old->chkinvprint,
-                    
                     // syspar2 → sys_setup
                     'vat_id_basis' => $old2->vatcdebasis,
                     'check_non_vat' => $old2->chknonvat,
@@ -237,10 +239,10 @@ class DataTransferController extends Controller
                 $targetDb->table('date_locking')->delete();
 
                 $excludedUsers = [
-                    'LSTVSTDUSER0001', 
-                    'LSTVSTDUSER0002', 
-                    'LSTVSTDUSER0003', 
-                    'lstv', 
+                    'LSTVSTDUSER0001',
+                    'LSTVSTDUSER0002',
+                    'LSTVSTDUSER0003',
+                    'lstv',
                     'LSTV-API-USER'
                 ];
 
@@ -276,14 +278,15 @@ class DataTransferController extends Controller
                 $targetDb->statement('SET FOREIGN_KEY_CHECKS = 0');
                 // do not delete ALL and MAIN branch branch_description
                 $targetDb->table($newTableName)
-                         ->where('branch_description', '!=', 'ALL')
                          ->where('branch_description', '!=', 'MAIN')
                          ->delete();
                 $targetDb->statement('SET FOREIGN_KEY_CHECKS = 1');
 
                 foreach ($sourceDb->table($oldTableName)->orderBy('recid')->lazy($chunkSize) as $old) {
+                    $branchId = $old->brhcde;   // Use brhcde as branch_id
+
                     $payload[] = [
-                        'branch_id' => $old->brhcde,
+                        'branch_id' => $branchId,
                         'branch_description' => $old->brhdsc,
                         'branch_prefix' => $this->generateBranchPrefix(
                             $this->optionalRowValue($old, 'prefix'),
@@ -301,7 +304,7 @@ class DataTransferController extends Controller
                     ];
 
                     $dateLockingPayload[] = [
-                        'branch_id' => $old->brhcde,
+                        'branch_id' => $branchId,
                         'sales_date_lock1' => $this->optionalRowValue($old, 'saldatelock1'),
                         'sales_date_lock2' => $this->optionalRowValue($old, 'saldatelock2'),
                         'created_at' => $now,
@@ -325,6 +328,19 @@ class DataTransferController extends Controller
                     $dateLockingRows += count($dateLockingPayload);
                 }
 
+                $tablesToUpdate = [
+                        'document_file_number_series',
+                        'mf_inventory_transactiontype_file2',
+                        'mf_warehouses',
+                        // Add more tables here if needed
+                    ];
+
+                foreach ($tablesToUpdate as $table) {
+                    $targetDb->table($table)
+                            ->whereIn('branch_id', ['LSTVDEFAULTBRANCH1', 'ALL'])
+                            ->update(['branch_id' => 'ALL']);
+                }
+
                 $allBranch = $targetDb->table($newTableName)
                     ->where('branch_id', 'ALL')
                     ->first();
@@ -344,11 +360,511 @@ class DataTransferController extends Controller
 
             #region User File Conversion
             if ($userFile) {
-                $oldTableName = 'userfile';
-                $newTableName = 'user';
                 $chunkSize = 500;
-                $userRows = 0;
-                $payload = [];
+                $companyId = trim((string) $request->input('company_name', ''));
+                $ensuredBranchIds = [];
+                $posUserRows = 0;
+                $userReportTypeRows = 0;
+                $skippedUserReportTypeRows = 0;
+                $userBranchRows = 0;
+                $skippedUserBranchRows = 0;
+                $posUserMenuRows = 0;
+                $skippedPosUserMenuRows = 0;
+                $userMenuRows = 0;
+                $userMenuActionRows = 0;
+                $skippedUserMenuRows = 0;
+                $validPosUserIds = [];
+                $posUserSourceMissing = false;
+                $userReportTypeSourceMissing = false;
+                $userBranchSourceMissing = false;
+                $posUserMenuSourceMissing = false;
+                $userMenuSourceMissing = false;
+                $appUserRows = 0;
+                $appUserSourceMissing = false;
+
+                // 1. pos_userfile → mf_pos_users + users (app login)
+                if ($this->sourceTableExists($sourceDb, 'pos_userfile')) {
+                if ($companyId === '') {
+                    throw new RuntimeException('Company ID is required for users conversion (used as first_name). Enter it in the Company ID field.');
+                }
+
+                $posUserPayload = [];
+                $appUserPayload = [];
+                $posUserUpdateColumns = [
+                    'username',
+                    'password',
+                    'user_type',
+                    'email',
+                    'approver',
+                    'receive_z_reading',
+                    'print_range',
+                    'card_holder',
+                    'card_number',
+                    'updated_at',
+                ];
+                $appUserUpdateColumns = [
+                    'username',
+                    'last_name',
+                    'password',
+                    'user_type',
+                    'first_name',
+                    'updated_at',
+                ];
+
+                foreach ($sourceDb->table('pos_userfile')->orderBy('recid')->lazy($chunkSize) as $old) {
+                    $userId = trim((string) ($old->usrcde ?? ''));
+                    if ($userId === '') {
+                        continue;
+                    }
+
+                    $validPosUserIds[$userId] = true;
+                    $userType = trim((string) ($this->optionalRowValue($old, 'usrtyp') ?? ''));
+                    $userType = $userType === '' ? 'User' : $userType;
+                    $password = $this->optionalRowValue($old, 'usrpwd');
+
+                    $posUserPayload[] = [
+                        'user_id' => $userId,
+                        'username' => $userId,
+                        'password' => $password,
+                        'user_type' => $userType,
+                        'email' => $this->optionalRowValue($old, 'email'),
+                        'approver' => $this->optionalRowValue($old, 'approver'),
+                        'receive_z_reading' => $this->optionalRowValue($old, 'receive_zreading'),
+                        'print_range' => $this->optionalRowValue($old, 'prntrange'),
+                        'card_holder' => $this->optionalRowValue($old, 'cardholder'),
+                        'card_number' => $this->optionalRowValue($old, 'cardno'),
+                        'created_at' => $now,
+                        'updated_at' => $now,
+                    ];
+
+                    $appUserPayload[] = [
+                        'user_id' => $userId,
+                        'username' => $userId,
+                        'last_name' => $userId,
+                        'password' => $password,
+                        'user_type' => $userType,
+                        'last_used_branch_id' => null,
+                        'first_name' => $companyId,
+                        'created_at' => $now,
+                        'updated_at' => $now,
+                    ];
+
+                    if (count($posUserPayload) >= $chunkSize) {
+                        $posUserRows += $this->upsertChunked($targetDb, 'mf_pos_users', $posUserPayload, ['user_id'], $posUserUpdateColumns);
+                        $appUserRows += $this->upsertChunked($targetDb, 'users', $appUserPayload, ['user_id'], $appUserUpdateColumns);
+                        $posUserPayload = [];
+                        $appUserPayload = [];
+                    }
+                }
+
+                if ($posUserPayload !== []) {
+                    $posUserRows += $this->upsertChunked($targetDb, 'mf_pos_users', $posUserPayload, ['user_id'], $posUserUpdateColumns);
+                }
+                if ($appUserPayload !== []) {
+                    $appUserRows += $this->upsertChunked($targetDb, 'users', $appUserPayload, ['user_id'], $appUserUpdateColumns);
+                }
+                } else {
+                    $posUserSourceMissing = true;
+                    $appUserSourceMissing = true;
+                    $this->noteMissingSourceTable('pos_userfile', $source, $target, $conversionNotes);
+                }
+
+                if ($validPosUserIds === []) {
+                    foreach ($targetDb->table('mf_pos_users')->pluck('user_id') as $posUserId) {
+                        $validPosUserIds[(string) $posUserId] = true;
+                    }
+                }
+
+                /*
+                 * Legacy users → users from source `users` table (lastbrnch, usrlvl, emailadd).
+                 * Disabled: app users are built from pos_userfile in step 1 above.
+                 *
+                 * if ($this->sourceTableExists($sourceDb, 'users')) { ... }
+                 */
+
+                // 2. userreporttypefile → mf_user_report_types
+                if ($this->sourceTableExists($sourceDb, 'userreporttypefile')) {
+                $userReportTypePayload = [];
+                $userReportTypeUpdateColumns = ['updated_at'];
+
+                foreach ($sourceDb->table('userreporttypefile')->orderBy('recid')->lazy($chunkSize) as $old) {
+                    $userId = trim((string) ($old->usrcde ?? ''));
+                    $reportType = trim((string) ($old->reptype ?? ''));
+
+                    if ($userId === '' || $reportType === '' || ! isset($validPosUserIds[$userId])) {
+                        $skippedUserReportTypeRows++;
+                        $note = "Skipped user report type for user \"{$userId}\" ({$reportType}): user not found in mf_pos_users.";
+                        $conversionNotes[] = $note;
+                        Log::warning($note, [
+                            'conversion' => 'user_file',
+                            'user_id' => $userId,
+                            'report_type' => $reportType,
+                            'source_database' => $source->database,
+                            'target_database' => $target->database,
+                        ]);
+
+                        continue;
+                    }
+
+                    $userReportTypePayload[] = [
+                        'user_id' => $userId,
+                        'report_type' => $reportType,
+                        'created_at' => $now,
+                        'updated_at' => $now,
+                    ];
+
+                    if (count($userReportTypePayload) >= $chunkSize) {
+                        $userReportTypeRows += $this->upsertChunked($targetDb,'mf_user_report_types',$userReportTypePayload,['user_id', 'report_type'],$userReportTypeUpdateColumns);
+                        $userReportTypePayload = [];
+                    }
+                }
+
+                if ($userReportTypePayload !== []) {
+                    $userReportTypeRows += $this->upsertChunked($targetDb,'mf_user_report_types',$userReportTypePayload,['user_id', 'report_type'],$userReportTypeUpdateColumns);
+                }
+                } else {
+                    $userReportTypeSourceMissing = true;
+                    $this->noteMissingSourceTable('userreporttypefile', $source, $target, $conversionNotes);
+                }
+
+                // 4. userbranchfile → mf_user_branch_file
+                if ($this->sourceTableExists($sourceDb, 'userbranchfile')) {
+                $userBranchPayload = [];
+                $userBranchUpdateColumns = ['updated_at'];
+
+                foreach ($sourceDb->table('userbranchfile')->orderBy('recid')->lazy($chunkSize) as $old) {
+                    $userId = trim((string) ($old->usrcde ?? ''));
+                    $branchId = trim((string) ($old->brhcde ?? ''));
+
+                    if ($userId === '' || ! isset($validPosUserIds[$userId])) {
+                        $skippedUserBranchRows++;
+                        $note = "Skipped user branch for user \"{$userId}\" ({$branchId}): user not found in mf_pos_users.";
+                        $conversionNotes[] = $note;
+                        Log::warning($note, [
+                            'conversion' => 'user_file',
+                            'user_id' => $userId,
+                            'branch_id' => $branchId,
+                            'source_database' => $source->database,
+                            'target_database' => $target->database,
+                        ]);
+
+                        continue;
+                    }
+
+                    if ($branchId === '') {
+                        $skippedUserBranchRows++;
+                        $note = "Skipped user branch for user \"{$userId}\": missing branch_id.";
+                        $conversionNotes[] = $note;
+                        Log::warning($note, [
+                            'conversion' => 'user_file',
+                            'user_id' => $userId,
+                            'source_database' => $source->database,
+                            'target_database' => $target->database,
+                        ]);
+
+                        continue;
+                    }
+
+                    $this->ensureBranchExists($sourceDb, $targetDb, $branchId, $now, $ensuredBranchIds, $conversionNotes);
+
+                    $userBranchPayload[] = [
+                        'user_id' => $userId,
+                        'branch_id' => $branchId,
+                        'created_at' => $now,
+                        'updated_at' => $now,
+                    ];
+
+                    if (count($userBranchPayload) >= $chunkSize) {
+                        $userBranchRows += $this->upsertChunked($targetDb,'mf_user_branch_file',$userBranchPayload,['user_id', 'branch_id'],$userBranchUpdateColumns);
+                        $userBranchPayload = [];
+                    }
+                }
+
+                if ($userBranchPayload !== []) {
+                    $userBranchRows += $this->upsertChunked($targetDb,'mf_user_branch_file',$userBranchPayload,['user_id', 'branch_id'],$userBranchUpdateColumns);
+                }
+                } else {
+                    $userBranchSourceMissing = true;
+                    $this->noteMissingSourceTable('userbranchfile', $source, $target, $conversionNotes);
+                }
+
+                // 5. pos_user_menus → pos_user_menus
+                if ($this->sourceTableExists($sourceDb, 'pos_user_menus')) {
+                $menuCaptionAliases = ['tenant' => 'warehouse'];
+                $posMenuIdsByCaption = [];
+                foreach ($targetDb->table('pos_menus')->get(['record_id', 'menu_caption']) as $posMenuRow) {
+                    $lookupKey = $this->normalizeLookupKey((string) ($posMenuRow->menu_caption ?? ''), $menuCaptionAliases);
+                    if ($lookupKey !== '') {
+                        $posMenuIdsByCaption[$lookupKey] = $posMenuRow->record_id;
+                    }
+                }
+
+                $targetDb->table('pos_user_menus')->delete();
+
+                $posUserMenuPayload = [];
+                foreach ($sourceDb->table('pos_user_menus')->orderBy('recid')->lazy($chunkSize) as $old) {
+                    $userId = trim((string) ($old->usrcde ?? ''));
+                    $branchId = trim((string) ($old->brhcde ?? ''));
+                    $menuCaption = trim((string) ($old->mencap ?? ''));
+                    $lookupKey = $this->normalizeLookupKey($menuCaption, $menuCaptionAliases);
+                    $menuId = $lookupKey !== '' ? ($posMenuIdsByCaption[$lookupKey] ?? null) : null;
+
+                    if ($userId === '' || ! isset($validPosUserIds[$userId])) {
+                        $skippedPosUserMenuRows++;
+                        $note = "Skipped POS user menu for user \"{$userId}\" ({$menuCaption}): user not found in mf_pos_users.";
+                        $conversionNotes[] = $note;
+                        Log::warning($note, [
+                            'conversion' => 'user_file',
+                            'user_id' => $userId,
+                            'menu_caption' => $menuCaption,
+                            'source_database' => $source->database,
+                            'target_database' => $target->database,
+                        ]);
+
+                        continue;
+                    }
+
+                    if ($branchId === '') {
+                        $skippedPosUserMenuRows++;
+                        $note = "Skipped POS user menu for user \"{$userId}\" ({$menuCaption}): missing branch_id.";
+                        $conversionNotes[] = $note;
+                        Log::warning($note, [
+                            'conversion' => 'user_file',
+                            'user_id' => $userId,
+                            'menu_caption' => $menuCaption,
+                            'source_database' => $source->database,
+                            'target_database' => $target->database,
+                        ]);
+
+                        continue;
+                    }
+
+                    if ($menuId === null) {
+                        $skippedPosUserMenuRows++;
+                        $note = "Skipped POS user menu for user \"{$userId}\": menu caption \"{$menuCaption}\" not found in pos_menus.";
+                        $conversionNotes[] = $note;
+                        Log::warning($note, [
+                            'conversion' => 'user_file',
+                            'user_id' => $userId,
+                            'menu_caption' => $menuCaption,
+                            'source_database' => $source->database,
+                            'target_database' => $target->database,
+                        ]);
+
+                        continue;
+                    }
+
+                    $this->ensureBranchExists($sourceDb, $targetDb, $branchId, $now, $ensuredBranchIds, $conversionNotes);
+
+                    $posUserMenuPayload[] = [
+                        'user_id' => $userId,
+                        'branch_id' => $branchId,
+                        'menu_id' => $menuId,
+                        'menu_caption' => $menuCaption,
+                        'menu_group' => $this->optionalRowValue($old, 'mengrp'),
+                        'has_add' => $this->optionalRowValue($old, 'has_add'),
+                        'has_delete' => $this->optionalRowValue($old, 'has_delete'),
+                        'has_edit' => $this->optionalRowValue($old, 'has_edit'),
+                        'has_import' => $this->optionalRowValue($old, 'has_import'),
+                        'has_print' => $this->optionalRowValue($old, 'has_print'),
+                        'has_resend' => $this->optionalRowValue($old, 'has_resend'),
+                        'has_void' => $this->optionalRowValue($old, 'has_void'),
+                        'created_at' => $now,
+                        'updated_at' => $now,
+                    ];
+
+                    if (count($posUserMenuPayload) >= $chunkSize) {
+                        $targetDb->table('pos_user_menus')->insert($posUserMenuPayload);
+                        $posUserMenuRows += count($posUserMenuPayload);
+                        $posUserMenuPayload = [];
+                    }
+                }
+
+                if ($posUserMenuPayload !== []) {
+                    $targetDb->table('pos_user_menus')->insert($posUserMenuPayload);
+                    $posUserMenuRows += count($posUserMenuPayload);
+                }
+                } else {
+                    $posUserMenuSourceMissing = true;
+                    $this->noteMissingSourceTable('pos_user_menus', $source, $target, $conversionNotes);
+                }
+
+                // 6. user_menus → user_menus + user_menu_actions (not yet enabled)
+                // if ($this->sourceTableExists($sourceDb, 'user_menus')) {
+                //     $menuIdsByProgram = [];
+                //     $menuIdsByCaption = [];
+                //     foreach ($targetDb->table('menus')->get(['menu_id', 'menprg', 'mencap']) as $menuRow) {
+                //         $programKey = $this->normalizeLookupKey((string) ($menuRow->menprg ?? ''));
+                //         $captionKey = $this->normalizeLookupKey((string) ($menuRow->mencap ?? ''));
+                //         if ($programKey !== '') {
+                //             $menuIdsByProgram[$programKey] = $menuRow->menu_id;
+                //         }
+                //         if ($captionKey !== '') {
+                //             $menuIdsByCaption[$captionKey] = $menuRow->menu_id;
+                //         }
+                //     }
+
+                //     $userMenuPayload = [];
+                //     $userMenuUpdateColumns = ['active', 'updated_at'];
+                //     $userMenuActionPayload = [];
+                //     $userMenuActionUpdateColumns = [
+                //         'allow_add',
+                //         'allow_edit',
+                //         'allow_delete',
+                //         'allow_print',
+                //         'allow_cancel',
+                //         'updated_at',
+                //     ];
+
+                //     foreach ($sourceDb->table('user_menus')->orderBy('recid')->lazy($chunkSize) as $old) {
+                //         $userId = trim((string) ($old->usrcde ?? ''));
+                //         $menuProgram = trim((string) ($old->menprg ?? ''));
+                //         $menuCaption = trim((string) ($old->mencap ?? ''));
+                //         $programKey = $this->normalizeLookupKey($menuProgram);
+                //         $captionKey = $this->normalizeLookupKey($menuCaption);
+                //         $menuId = $programKey !== ''
+                //             ? ($menuIdsByProgram[$programKey] ?? null)
+                //             : null;
+
+                //         if ($menuId === null && $captionKey !== '') {
+                //             $menuId = $menuIdsByCaption[$captionKey] ?? null;
+                //         }
+
+                //         if ($userId === '' || ! isset($validPosUserIds[$userId])) {
+                //             $skippedUserMenuRows++;
+                //             $note = "Skipped user menu for user \"{$userId}\" ({$menuProgram}/{$menuCaption}): user not found in mf_pos_users.";
+                //             $conversionNotes[] = $note;
+                //             Log::warning($note, [
+                //                 'conversion' => 'user_file',
+                //                 'user_id' => $userId,
+                //                 'menu_program' => $menuProgram,
+                //                 'menu_caption' => $menuCaption,
+                //                 'source_database' => $source->database,
+                //                 'target_database' => $target->database,
+                //             ]);
+
+                //             continue;
+                //         }
+
+                //         if ($menuId === null) {
+                //             $skippedUserMenuRows++;
+                //             $note = "Skipped user menu for user \"{$userId}\": menu \"{$menuProgram}\" / \"{$menuCaption}\" not found in menus.";
+                //             $conversionNotes[] = $note;
+                //             Log::warning($note, [
+                //                 'conversion' => 'user_file',
+                //                 'user_id' => $userId,
+                //                 'menu_program' => $menuProgram,
+                //                 'menu_caption' => $menuCaption,
+                //                 'source_database' => $source->database,
+                //                 'target_database' => $target->database,
+                //             ]);
+
+                //             continue;
+                //         }
+
+                //         $userMenuPayload[] = [
+                //             'user_id' => $userId,
+                //             'menu_id' => $menuId,
+                //             'active' => 1,
+                //             'created_at' => $now,
+                //             'updated_at' => $now,
+                //         ];
+
+                //         $userMenuActionPayload[] = [
+                //             'user_id' => $userId,
+                //             'menu_id' => $menuId,
+                //             'allow_add' => $this->optionalRowValue($old, 'has_add'),
+                //             'allow_edit' => $this->optionalRowValue($old, 'has_edit'),
+                //             'allow_delete' => $this->optionalRowValue($old, 'has_delete'),
+                //             'allow_print' => $this->optionalRowValue($old, 'has_print'),
+                //             'allow_cancel' => $this->optionalRowValue($old, 'has_void'),
+                //             'created_at' => $now,
+                //             'updated_at' => $now,
+                //         ];
+
+                //         if (count($userMenuPayload) >= $chunkSize) {
+                //             $userMenuRows += $this->upsertChunked(
+                //                 $targetDb,
+                //                 'user_menus',
+                //                 $userMenuPayload,
+                //                 ['user_id', 'menu_id'],
+                //                 $userMenuUpdateColumns,
+                //             );
+                //             $userMenuActionRows += $this->upsertChunked(
+                //                 $targetDb,
+                //                 'user_menu_actions',
+                //                 $userMenuActionPayload,
+                //                 ['user_id', 'menu_id'],
+                //                 $userMenuActionUpdateColumns,
+                //             );
+                //             $userMenuPayload = [];
+                //             $userMenuActionPayload = [];
+                //         }
+                //     }
+
+                //     if ($userMenuPayload !== []) {
+                //         $userMenuRows += $this->upsertChunked(
+                //             $targetDb,
+                //             'user_menus',
+                //             $userMenuPayload,
+                //             ['user_id', 'menu_id'],
+                //             $userMenuUpdateColumns,
+                //         );
+                //         $userMenuActionRows += $this->upsertChunked(
+                //             $targetDb,
+                //             'user_menu_actions',
+                //             $userMenuActionPayload,
+                //             ['user_id', 'menu_id'],
+                //             $userMenuActionUpdateColumns,
+                //         );
+                //     }
+                // } else {
+                //     $userMenuSourceMissing = true;
+                //     $this->noteMissingSourceTable('user_menus', $source, $target, $conversionNotes);
+                // }
+
+                $totalRows += $posUserRows + $appUserRows + $userReportTypeRows + $userBranchRows + $posUserMenuRows + $userMenuRows + $userMenuActionRows;
+
+                $transferredTables[] = $posUserSourceMissing
+                    ? 'pos_userfile → mf_pos_users (skipped, source table not found)'
+                    : "pos_userfile → mf_pos_users ({$posUserRows} row(s))";
+
+                $appUserSummary = $appUserSourceMissing
+                    ? 'pos_userfile → users (skipped, source table not found)'
+                    : "pos_userfile → users ({$appUserRows} row(s))";
+                $transferredTables[] = $appUserSummary;
+
+                $userReportTypeSummary = $userReportTypeSourceMissing
+                    ? 'userreporttypefile → mf_user_report_types (skipped, source table not found)'
+                    : "userreporttypefile → mf_user_report_types ({$userReportTypeRows} row(s))";
+                if ($skippedUserReportTypeRows > 0) {
+                    $userReportTypeSummary .= ", {$skippedUserReportTypeRows} skipped (missing user)";
+                }
+                $transferredTables[] = $userReportTypeSummary;
+
+                $userBranchSummary = $userBranchSourceMissing
+                    ? 'userbranchfile → mf_user_branch_file (skipped, source table not found)'
+                    : "userbranchfile → mf_user_branch_file ({$userBranchRows} row(s))";
+                if ($skippedUserBranchRows > 0) {
+                    $userBranchSummary .= ", {$skippedUserBranchRows} skipped (missing user or branch)";
+                }
+                $transferredTables[] = $userBranchSummary;
+
+                $posUserMenuSummary = $posUserMenuSourceMissing
+                    ? 'pos_user_menus → pos_user_menus (skipped, source table not found)'
+                    : "pos_user_menus → pos_user_menus ({$posUserMenuRows} row(s))";
+                if ($skippedPosUserMenuRows > 0) {
+                    $posUserMenuSummary .= ", {$skippedPosUserMenuRows} skipped (missing user, branch, or menu)";
+                }
+                $transferredTables[] = $posUserMenuSummary;
+
+                $userMenuSummary = $userMenuSourceMissing
+                    ? 'user_menus → user_menus (skipped, source table not found)'
+                    : "user_menus → user_menus ({$userMenuRows} row(s)), user_menu_actions ({$userMenuActionRows} row(s))";
+                if ($skippedUserMenuRows > 0) {
+                    $userMenuSummary .= ", {$skippedUserMenuRows} skipped (missing user or menu)";
+                }
+                $transferredTables[] = $userMenuSummary;
             }
             #endregion
 
@@ -384,7 +900,7 @@ class DataTransferController extends Controller
                         $payload = [];
                     }
                 }
-                
+
                 if ($payload !== []) {
                     $targetDb->table($newTableName)->insert($payload);
                     $currencyRows += count($payload);
@@ -447,7 +963,7 @@ class DataTransferController extends Controller
                         $payload = [];
                     }
                 }
-                
+
                 if ($payload !== []) {
                     $targetDb->table($newTableName)->insert($payload);
                     $taxCodeRows += count($payload);
@@ -494,8 +1010,8 @@ class DataTransferController extends Controller
                     $payload[] = [
                         'item_classification_id' => $old->itmclacde,
                         'item_classification_description' => $old->itmcladsc,
-                        'is_modified' => $old->ismodified,
-                        'is_exported' => $old->isexported,
+                        'is_modified' => $old->ismodified ?? 1,
+                        'is_exported' => $old->isexported ?? 1,
                         'created_at' => $now,
                         'updated_at' => $now,
                     ];
@@ -506,7 +1022,7 @@ class DataTransferController extends Controller
                         $payload = [];
                     }
                 }
-                
+
                 if ($payload !== []) {
                     $targetDb->table($newTableName)->insert($payload);
                     $itemClassificationRows += count($payload);
@@ -575,8 +1091,8 @@ class DataTransferController extends Controller
                         'last_modified' => $old->lastmod,
                         'hide_subclass' => $old->hide_subclass,
                         'subclass_image' => $old->subclassimage,
-                        'is_modified' => $old->ismodified,
-                        'is_exported' => $old->isexported,
+                        'is_modified' => $old->ismodified ?? 1,
+                        'is_exported' => $old->isexported ?? 1,
                         'created_at' => $now,
                         'updated_at' => $now,
                     ];
@@ -587,7 +1103,7 @@ class DataTransferController extends Controller
                         $payload = [];
                     }
                 }
-                
+
                 if ($payload !== []) {
                     $targetDb->table($newTableName)->insert($payload);
                     $itemSubClassRows += count($payload);
@@ -620,8 +1136,8 @@ class DataTransferController extends Controller
                         'warehouse_id' => $old->warcde,
                         'warehouse_description' => $old->wardsc,
                         'branch_id' => $old->brhcde,
-                        'is_modified' => $old->ismodified,
-                        'is_exported' => $old->isexported,
+                        'is_modified' => $old->ismodified ?? 1,
+                        'is_exported' => $old->isexported ?? 1,
                         'include_critical_level' => $old->inccrilvl,
                         'created_at' => $now,
                         'updated_at' => $now,
@@ -633,7 +1149,7 @@ class DataTransferController extends Controller
                         $payload = [];
                     }
                 }
-                
+
                 if ($payload !== []) {
                     $targetDb->table($newTableName)->insert($payload);
                     $warehouseRows += count($payload);
@@ -693,7 +1209,7 @@ class DataTransferController extends Controller
                         'dine_type_id' => $old->postypcde,
                         'dine_type' => $old->postypdsc,
                         'order_type' => $old->ordertyp,
-                        'is_modified' => $old->ismodified,
+                        'is_modified' => $old->ismodified ?? 1,
                         'created_at' => $now,
                         'updated_at' => $now,
                     ];
@@ -704,7 +1220,7 @@ class DataTransferController extends Controller
                         $payload = [];
                     }
                 }
-                
+
                 if ($payload !== []) {
                     $targetDb->table($newTableName)->insert($payload);
                     $dineTypeRows += count($payload);
@@ -754,8 +1270,8 @@ class DataTransferController extends Controller
                         'card_types_id' => $old->cardtype,
                         'card_types_description' => $old->cardtypedsc !== null && $old->cardtypedsc !== '' ? $old->cardtypedsc : $old->cardtype,
                         'old_card_types_id' => $old->oldcardtype,
-                        'is_modified' => $old->ismodified,
-                        'is_exported' => $old->isexported,
+                        'is_modified' => $old->ismodified ?? 1,
+                        'is_exported' => $old->isexported ?? 1,
                         'created_at' => $now,
                         'updated_at' => $now,
                     ];
@@ -818,8 +1334,8 @@ class DataTransferController extends Controller
                         'memc_description' => $old->codedsc,
                         'prev_memc_id' => $old->prev_code,
                         'value' => $old->value,
-                        'is_modified' => $old->ismodified,
-                        'is_exported' => $old->isexported,
+                        'is_modified' => $old->ismodified ?? 1,
+                        'is_exported' => $old->isexported ?? 1,
                         'created_at' => $now,
                         'updated_at' => $now,
                     ];
@@ -880,8 +1396,8 @@ class DataTransferController extends Controller
                     $payload[] = [
                         'payment_type_id' => $old->paytyp,
                         'payment_type_description' => $old->paytypdsc !== null && $old->paytypdsc !== '' ? $old->paytypdsc : $old->paytyp,
-                        'is_exported' => $old->isexported,
-                        'is_modified' => $old->ismodified,
+                        'is_exported' => $old->isexported ?? 1,
+                        'is_modified' => $old->ismodified ?? 1,
                         'created_at' => $now,
                         'updated_at' => $now,
                     ];
@@ -916,7 +1432,7 @@ class DataTransferController extends Controller
                 $chunkSize = 500;
                 $itemRows = 0;
                 $itemUnitRows = 0;
-                $skippedCorruptedItems = 0;
+                $nullifiedItemReferences = 0;
                 $payload = [];
                 $unitPayload = [];
                 $insertedItemIds = [];
@@ -959,33 +1475,35 @@ class DataTransferController extends Controller
                     $classificationId = trim((string) ($old->itmclacde ?? ''));
                     $subClassificationId = trim((string) ($old->itemsubclasscde ?? ''));
 
-                    $skipReason = null;
-
                     if ($classificationId === '' || ! isset($validClassificationIds[$classificationId])) {
-                        $skipReason = $classificationId === ''
-                            ? 'missing item_classification_id'
-                            : "item_classification_id \"{$classificationId}\" not found in mf_itemclassifications";
-                    } elseif ($subClassificationId !== '' && ! isset($validSubClassificationIds[$subClassificationId])) {
-                        $skipReason = "item_sub_classification_id \"{$subClassificationId}\" not found in mf_itemsubclassifications";
+                        if ($classificationId !== '') {
+                            $nullifiedItemReferences++;
+                            $note = "Set item_classification_id to null for item \"{$old->itmcde}\" ({$old->itmdsc}): \"{$classificationId}\" not found in mf_itemclassifications.";
+                            $conversionNotes[] = $note;
+                            Log::warning($note, [
+                                'conversion' => 'item',
+                                'item_id' => $old->itmcde,
+                                'item_classification_id' => $classificationId,
+                                'source_database' => $source->database,
+                                'target_database' => $target->database,
+                            ]);
+                        }
+                        $classificationId = null;
                     }
 
-                    if ($skipReason !== null) {
-                        $skippedCorruptedItems++;
-                        $note = "Skipped corrupted item \"{$old->itmcde}\" ({$old->itmdsc}): {$skipReason}.";
+                    if ($subClassificationId !== '' && ! isset($validSubClassificationIds[$subClassificationId])) {
+                        $nullifiedItemReferences++;
+                        $note = "Set item_sub_classification_id to null for item \"{$old->itmcde}\" ({$old->itmdsc}): \"{$subClassificationId}\" not found in mf_itemsubclassifications.";
                         $conversionNotes[] = $note;
                         Log::warning($note, [
                             'conversion' => 'item',
                             'item_id' => $old->itmcde,
-                            'item_classification_id' => $classificationId !== '' ? $classificationId : null,
-                            'item_sub_classification_id' => $subClassificationId !== '' ? $subClassificationId : null,
+                            'item_sub_classification_id' => $subClassificationId,
                             'source_database' => $source->database,
                             'target_database' => $target->database,
                         ]);
-
-                        continue;
-                    }
-
-                    if ($subClassificationId === '') {
+                        $subClassificationId = null;
+                    } elseif ($subClassificationId === '') {
                         $subClassificationId = null;
                     }
 
@@ -1060,8 +1578,8 @@ class DataTransferController extends Controller
                         'item_balance' => $old->itmbal,
                         'inactive' => $old->inactive,
                         'senior_citizen_pwd_discount' => $old->scpwddis,
-                        'is_modified' => $old->ismodified,
-                        'is_exported' => $old->isexported,
+                        'is_modified' => $old->ismodified ?? 1,
+                        'is_exported' => $old->isexported ?? 1,
                         'item_description_short' => $old->itmdscshort,
                         'item_include_in' => 'SAL,REC,INV,FG,RM',
                         'created_at' => $now,
@@ -1152,8 +1670,8 @@ class DataTransferController extends Controller
 
                 $totalRows += $itemRows + $itemUnitRows;
                 $itemSummary = "{$oldTableName} → {$newTableName} ({$itemRows} row(s))";
-                if ($skippedCorruptedItems > 0) {
-                    $itemSummary .= ", {$skippedCorruptedItems} corrupted item(s) skipped";
+                if ($nullifiedItemReferences > 0) {
+                    $itemSummary .= ", {$nullifiedItemReferences} invalid reference(s) set to null";
                 }
                 $transferredTables[] = $itemSummary;
                 $transferredTables[] = "{$oldUnitTableName} → {$newUnitTableName} ({$itemUnitRows} row(s))";
@@ -1271,8 +1789,8 @@ class DataTransferController extends Controller
                         'special_request_id' => $old->modcde,
                         'special_request_description' => $old->modcde,
                         'special_request_price' => $old->modprc,
-                        'is_modified' => $old->ismodified,
-                        'is_exported' => $old->isexported,
+                        'is_modified' => $old->ismodified ?? 1,
+                        'is_exported' => $old->isexported ?? 1,
                         'created_at' => $now,
                         'updated_at' => $now,
                     ];
@@ -1379,8 +1897,8 @@ class DataTransferController extends Controller
                     $payload[] = [
                         'free_reason_id' => $old->freereason,
                         'free_reason_description' => $old->freereasondsc !== null && $old->freereasondsc !== '' ? $old->freereasondsc : $old->freereason,
-                        'is_modified' => $old->ismodified,
-                        'is_exported' => $old->isexported,
+                        'is_modified' => $old->ismodified ?? 1,
+                        'is_exported' => $old->isexported ?? 1,
                         'created_at' => $now,
                         'updated_at' => $now,
                     ];
@@ -1441,8 +1959,8 @@ class DataTransferController extends Controller
                     $payload[] = [
                         'void_id' => $old->voidcde,
                         'void_description' => $old->voiddsc !== null && $old->voiddsc !== '' ? $old->voiddsc : $old->voidcde,
-                        'is_modified' => $old->ismodified,
-                        'is_exported' => $old->isexported,
+                        'is_modified' => $old->ismodified ?? 1,
+                        'is_exported' => $old->isexported ?? 1,
                         'created_at' => $now,
                         'updated_at' => $now,
                     ];
@@ -1503,8 +2021,8 @@ class DataTransferController extends Controller
                         'cashioreason_id' => $old->cashioreason,
                         'cashioreason_description' => $old->cashioreason,
                         'cashioreason_type' => $old->type,
-                        'is_modified' => $old->ismodified,
-                        'is_exported' => $old->isexported,
+                        'is_modified' => $old->ismodified ?? 1,
+                        'is_exported' => $old->isexported ?? 1,
                         'created_at' => $now,
                         'updated_at' => $now,
                     ];
@@ -1563,7 +2081,7 @@ class DataTransferController extends Controller
                         'branch_id' => $old->brhcde,
                         'warehouse_id' => $old->warcde !== null && $old->warcde !== '' ? $old->warcde : null,
                         'check_manual' => $old->chkmanual,
-                        'is_exported' => $old->isexported,
+                        'is_exported' => $old->isexported ?? 1,
                         'created_at' => $now,
                         'updated_at' => $now,
                     ];
@@ -1918,6 +2436,55 @@ class DataTransferController extends Controller
 
         $conversionNotes[] = $note;
         Log::warning($note);
+    }
+
+    protected function sourceTableExists(mixed $db, string $table): bool
+    {
+        try {
+            return $db->getSchemaBuilder()->hasTable($table);
+        } catch (Throwable) {
+            return false;
+        }
+    }
+
+    protected function noteMissingSourceTable(string $sourceTable,RemoteDatabaseConfig $source,RemoteDatabaseConfig $target,array &$conversionNotes): void
+    {
+        $note = "Skipped conversion for \"{$sourceTable}\": source table not found in {$source->database}. Target data was left unchanged.";
+        $conversionNotes[] = $note;
+        Log::warning($note, [
+            'conversion' => 'user_file',
+            'source_table' => $sourceTable,
+            'source_database' => $source->database,
+            'target_database' => $target->database,
+        ]);
+    }
+
+    protected function normalizeLookupKey(string $value, array $aliases = []): string
+    {
+        $normalized = strtolower(trim($value));
+
+        foreach ($aliases as $from => $to)
+        {
+            if ($normalized === strtolower($from))
+            {
+                $normalized = strtolower($to);
+                break;
+            }
+        }
+
+        return $normalized;
+    }
+
+    protected function upsertChunked(mixed $targetDb,string $table, array $payload, array $uniqueBy, array $updateColumns): int
+    {
+        if ($payload === [])
+        {
+            return 0;
+        }
+
+        $targetDb->table($table)->upsert($payload, $uniqueBy, $updateColumns);
+
+        return count($payload);
     }
 
     protected function optionalRowValue(mixed $row, string $property, mixed $default = null): mixed
