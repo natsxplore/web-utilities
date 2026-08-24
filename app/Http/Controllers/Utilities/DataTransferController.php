@@ -25,6 +25,8 @@ class DataTransferController extends Controller
         'item_classification' => 'item_classification',
         'item_sub_class' => 'item_sub_class',
         'warehouse' => 'warehouse',
+        'area' => 'area',
+        'table' => 'table',
         'dine_type' => 'dine_type',
         'card_type' => 'card_type',
         'memc' => 'memc',
@@ -76,6 +78,8 @@ class DataTransferController extends Controller
             $itemClassification = $request->boolean('item_classification');
             $itemSubClass = $request->boolean('item_sub_class');
             $warehouse = $request->boolean('warehouse');
+            $area = $request->boolean('area');
+            $table = $request->boolean('table');
             $dineType = $request->boolean('dine_type');
             $cardType = $request->boolean('card_type');
             $memc = $request->boolean('memc');
@@ -1176,6 +1180,88 @@ class DataTransferController extends Controller
             }
             #endregion
 
+                #region Area Conversion
+                if ($area) {
+                    $oldTableName = 'areafile';
+                    $newTableName = 'mf_areas';
+                    $chunkSize = 500;
+                    $areaRows = 0;
+                    $payload = [];
+
+                    foreach ($sourceDb->table($oldTableName)->orderBy('recid')->lazy($chunkSize) as $old) {
+                        $desc = trim((string) ($old->areadsc ?? ''));
+                        if ($desc === '') {
+                            $desc = $old->areacde;
+                        }
+
+                        $payload[] = [
+                            'area_id' => $old->areacde,
+                            'area_description' => $desc,
+                            'is_modified' => $old->ismodified ?? 1,
+                            'is_exported' => $old->isexported ?? 1,
+                            'created_at' => $now,
+                            'updated_at' => $now,
+                        ];
+
+                        if (count($payload) >= $chunkSize) {
+                            $targetDb->table($newTableName)->insert($payload);
+                            $areaRows += count($payload);
+                            $payload = [];
+                        }
+                    }
+
+                    if ($payload !== []) {
+                        $targetDb->table($newTableName)->insert($payload);
+                        $areaRows += count($payload);
+                    }
+
+                    $totalRows += $areaRows;
+                    $transferredTables[] = "{$oldTableName} → {$newTableName} ({$areaRows} row(s))";
+                }
+                #endregion
+
+                #region Table Conversion
+                if ($table) {
+                    $oldTableName = 'tablefile';
+                    $newTableName = 'mf_tables';
+                    $chunkSize = 500;
+                    $tableRows = 0;
+                    $payload = [];
+
+                    foreach ($sourceDb->table($oldTableName)->orderBy('recid')->lazy($chunkSize) as $old) {
+                        $payload[] = [
+                            'table_id' => $old->tablecde,
+                            'table_description' => $old->tabledsc,
+                            'seat_capacity' => $old->seatcap,
+                            'x' => $old->x,
+                            'y' => $old->y,
+                            'lock_table' => $old->locktable,
+                            'shape' => $old->shape,
+                            'inactive' => $old->inactive,
+                            'area_id' => $old->areacde,
+                            'is_modified' => $old->ismodified ?? 1,
+                            'is_exported' => $old->isexported ?? 1,
+                            'created_at' => $now,
+                            'updated_at' => $now,
+                        ];
+
+                        if (count($payload) >= $chunkSize) {
+                            $targetDb->table($newTableName)->insert($payload);
+                            $tableRows += count($payload);
+                            $payload = [];
+                        }
+                    }
+
+                    if ($payload !== []) {
+                        $targetDb->table($newTableName)->insert($payload);
+                        $tableRows += count($payload);
+                    }
+
+                    $totalRows += $tableRows;
+                    $transferredTables[] = "{$oldTableName} → {$newTableName} ({$tableRows} row(s))";
+                }
+                #endregion
+
             #region Dine Type Conversion
             if ($dineType) {
                 $oldTableName = 'postypefile';
@@ -2150,6 +2236,7 @@ class DataTransferController extends Controller
                     }
 
                     if ($itemId === '' || ! array_key_exists($itemId, $itemDescriptionsById)) {
+
                         $skippedPriceCodeFile2Rows++;
                         $note = "Skipped price list detail for price \"{$priceId}\": item_id \"{$itemId}\" not found in mf_items.";
                         $conversionNotes[] = $note;
@@ -2164,24 +2251,24 @@ class DataTransferController extends Controller
                         continue;
                     }
 
-                    $masterItemDescription = $itemDescriptionsById[$itemId];
+                    // $masterItemDescription = $itemDescriptionsById[$itemId];
 
-                    if ($itemDescription !== $masterItemDescription) {
-                        $skippedPriceCodeFile2Rows++;
-                        $note = "Skipped price list detail for price \"{$priceId}\": item_id \"{$itemId}\" description \"{$itemDescription}\" does not match item master \"{$masterItemDescription}\".";
-                        $conversionNotes[] = $note;
-                        Log::warning($note, [
-                            'conversion' => 'price_list',
-                            'price_id' => $priceId,
-                            'item_id' => $itemId,
-                            'item_description' => $itemDescription,
-                            'master_item_description' => $masterItemDescription,
-                            'source_database' => $source->database,
-                            'target_database' => $target->database,
-                        ]);
+                    // if ($itemDescription !== $masterItemDescription) {
+                    //     $skippedPriceCodeFile2Rows++;
+                    //     $note = "Skipped price list detail for price \"{$priceId}\": item_id \"{$itemId}\" description \"{$itemDescription}\" does not match item master \"{$masterItemDescription}\".";
+                    //     $conversionNotes[] = $note;
+                    //     Log::warning($note, [
+                    //         'conversion' => 'price_list',
+                    //         'price_id' => $priceId,
+                    //         'item_id' => $itemId,
+                    //         'item_description' => $itemDescription,
+                    //         'master_item_description' => $masterItemDescription,
+                    //         'source_database' => $source->database,
+                    //         'target_database' => $target->database,
+                    //     ]);
 
-                        continue;
-                    }
+                    //     continue;
+                    // }
 
                     $this->ensureBranchExists($sourceDb, $targetDb, $old->brhcde, $now, $ensuredBranchIds, $conversionNotes);
 
@@ -2195,7 +2282,7 @@ class DataTransferController extends Controller
                     $payload[] = [
                         'price_id' => $old->prccde,
                         'item_id' => $old->itmcde,
-                        'item_description' => $masterItemDescription,
+                        'item_description' => $itemDescription,
                         'unit_of_measure' => $old->untmea,
                         'gross_price' => $grossPrice,
                         'unit_price' => $unitPrice,

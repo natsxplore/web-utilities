@@ -164,6 +164,8 @@
                             ['id' => 'item_classification', 'label' => 'Item Classification', 'hint' => null],
                             ['id' => 'item_sub_class', 'label' => 'Item Sub Class', 'hint' => null],
                             ['id' => 'warehouse', 'label' => 'Warehouse', 'hint' => null],
+                            ['id' => 'area', 'label' => 'Area', 'hint' => 'areafile → mf_areas'],
+                            ['id' => 'table', 'label' => 'Table', 'hint' => 'tablefile → mf_tables'],
                             ['id' => 'dine_type', 'label' => 'Dine Type', 'hint' => null],
                             ['id' => 'card_type', 'label' => 'Card Type', 'hint' => 'cardtypefile → mf_cardtypes'],
                             ['id' => 'memc', 'label' => 'MEMC', 'hint' => 'memcfile → mf_memcfile'],
