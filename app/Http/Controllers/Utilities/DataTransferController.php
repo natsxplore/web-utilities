@@ -248,6 +248,7 @@ class DataTransferController extends Controller
                     'LSTVSTDUSER0001',
                     'LSTVSTDUSER0002',
                     'LSTVSTDUSER0003',
+                    'LSTVSTDUSER0004',
                     'lstv',
                     'LSTV-API-USER'
                 ];
