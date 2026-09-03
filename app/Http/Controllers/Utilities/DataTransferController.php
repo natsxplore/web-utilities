@@ -284,7 +284,7 @@ class DataTransferController extends Controller
                 $targetDb->statement('SET FOREIGN_KEY_CHECKS = 0');
                 // do not delete ALL and MAIN branch branch_description
                 $targetDb->table($newTableName)
-                         ->where('branch_description', '!=', 'MAIN')
+                        //  ->where('branch_description', '!=', 'MAIN')
                          ->delete();
                 $targetDb->statement('SET FOREIGN_KEY_CHECKS = 1');
 
@@ -294,11 +294,11 @@ class DataTransferController extends Controller
                     $payload[] = [
                         'branch_id' => $branchId,
                         'branch_description' => $old->brhdsc,
-                        'branch_prefix' => $this->generateBranchPrefix(
+                        'branch_prefix' => $old->prefix == null || $old->prefix == '' ? $this->generateBranchPrefix(
                             $this->optionalRowValue($old, 'prefix'),
                             $old->brhdsc,
                             $old->brhcde,
-                        ),
+                        ) : $old->prefix,
                         'business1' => $this->optionalRowValue($old, 'business1'),
                         'business2' => $this->optionalRowValue($old, 'business2'),
                         'business3' => $this->optionalRowValue($old, 'business3'),
@@ -1242,7 +1242,7 @@ class DataTransferController extends Controller
                         'location_id' => $old->locationcde,
                         'last_modified' => $old->lastmod,
                         'hide_subclass' => $old->hide_subclass,
-                        'subclass_image' => $old->subclassimage,
+                        'subclass_image' => $old->subclassimage ?? null,
                         'is_modified' => $old->ismodified ?? 1,
                         'is_exported' => $old->isexported ?? 1,
                         'created_at' => $now,
@@ -2445,7 +2445,7 @@ class DataTransferController extends Controller
                         'customer_item_id' => $old->cusitmcde,
                         'sales_quota' => $old->salquota,
                         'discount_id' => $old->disccde,
-                        'branch_id' => $old->brhcde,
+                        'branch_id' => $old->brhcde == '' || $old->brhcde == null ? null : $old->brhcde,
                         'pos_price_code' => $priceDescriptionsByPriceId[$old->prccde] ?? null,
                         'created_at' => $now,
                         'updated_at' => $now,
