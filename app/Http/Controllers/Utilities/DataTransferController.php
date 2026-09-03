@@ -22,6 +22,7 @@ class DataTransferController extends Controller
         'user_file' => 'user_file',
         'currency' => 'currency',
         'tax_code' => 'tax_code',
+        'evat_code' => 'evat_code',
         'item_classification' => 'item_classification',
         'item_sub_class' => 'item_sub_class',
         'warehouse' => 'warehouse',
@@ -75,6 +76,7 @@ class DataTransferController extends Controller
             $userFile = $request->boolean('user_file');
             $currencyFile = $request->boolean('currency');
             $taxCode = $request->boolean('tax_code');
+            $evatCode = $request->boolean('evat_code');
             $itemClassification = $request->boolean('item_classification');
             $itemSubClass = $request->boolean('item_sub_class');
             $warehouse = $request->boolean('warehouse');
@@ -485,10 +487,101 @@ class DataTransferController extends Controller
 
                 /*
                  * Legacy users → users from source `users` table (lastbrnch, usrlvl, emailadd).
-                 * Disabled: app users are built from pos_userfile in step 1 above.
-                 *
-                 * if ($this->sourceTableExists($sourceDb, 'users')) { ... }
+                 * We will use `lastbrnch` (if present) to set `last_used_branch_id` on the target `users`.
                  */
+
+                if ($this->sourceTableExists($sourceDb, 'users')) {
+                    $userBranchPayload = [];
+                    $userBranchUpdateColumns = ['last_used_branch_id', 'updated_at'];
+
+                    foreach ($sourceDb->table('users')->orderBy('recid')->lazy($chunkSize) as $old) {
+                        $userId = trim((string) ($this->optionalRowValue($old, 'usrcde') ?? ''));
+                        $lastBranch = trim((string) ($this->optionalRowValue($old, 'lastbrnch') ?? ''));
+
+                        if ($userId === '' || $lastBranch === '') {
+                            continue;
+                        }
+
+                        // ensure branch exists in target (will create if possible)
+                        $this->ensureBranchExists($sourceDb, $targetDb, $lastBranch, $now, $ensuredBranchIds, $conversionNotes);
+
+                        $branchExists = $targetDb->table('mf_branch')->where('branch_id', $lastBranch)->exists();
+                        if (! $branchExists) {
+                            $skippedUserBranchRows++;
+                            $note = "Skipped setting last branch for user \"{$userId}\": branch \"{$lastBranch}\" not found in mf_branch.";
+                            $conversionNotes[] = $note;
+                            Log::warning($note, [
+                                'conversion' => 'user_file',
+                                'user_id' => $userId,
+                                'branch_id' => $lastBranch,
+                                'source_database' => $source->database,
+                                'target_database' => $target->database,
+                            ]);
+
+                            continue;
+                        }
+
+                        // Only update users that already exist in the target `users` table.
+                        $userExists = $targetDb->table('users')->where('user_id', $userId)->exists();
+                        if (! $userExists) {
+                            // skip silently — users were created from pos_userfile earlier
+                            continue;
+                        }
+
+                        $userBranchPayload[] = [
+                            'user_id' => $userId,
+                            'last_used_branch_id' => $lastBranch,
+                            'updated_at' => $now,
+                        ];
+
+                        if (count($userBranchPayload) >= $chunkSize) {
+                            // perform an UPDATE ... CASE ... to avoid INSERT attempts which fail when required columns are missing
+                            $pdo = $targetDb->getPdo();
+                            $ids = array_column($userBranchPayload, 'user_id');
+                            $existingCount = $targetDb->table('users')->whereIn('user_id', $ids)->count();
+
+                            if ($existingCount > 0) {
+                                $caseBranch = '';
+                                $caseUpdated = '';
+                                foreach ($userBranchPayload as $p) {
+                                    $caseBranch .= " WHEN " . $pdo->quote($p['user_id']) . " THEN " . $pdo->quote($p['last_used_branch_id']);
+                                    $caseUpdated .= " WHEN " . $pdo->quote($p['user_id']) . " THEN " . $pdo->quote($p['updated_at']);
+                                }
+
+                                $inList = implode(',', array_map(function ($v) use ($pdo) { return $pdo->quote($v); }, $ids));
+
+                                $sql = "UPDATE `users` SET `last_used_branch_id` = CASE `user_id`" . $caseBranch . " END, `updated_at` = CASE `user_id`" . $caseUpdated . " END WHERE `user_id` IN (" . $inList . ")";
+                                $targetDb->statement($sql);
+                                $appUserRows += $existingCount;
+                            }
+
+                            $userBranchPayload = [];
+                        }
+                    }
+
+                    if ($userBranchPayload !== []) {
+                        $pdo = $targetDb->getPdo();
+                        $ids = array_column($userBranchPayload, 'user_id');
+                        $existingCount = $targetDb->table('users')->whereIn('user_id', $ids)->count();
+
+                        if ($existingCount > 0) {
+                            $caseBranch = '';
+                            $caseUpdated = '';
+                            foreach ($userBranchPayload as $p) {
+                                $caseBranch .= " WHEN " . $pdo->quote($p['user_id']) . " THEN " . $pdo->quote($p['last_used_branch_id']);
+                                $caseUpdated .= " WHEN " . $pdo->quote($p['user_id']) . " THEN " . $pdo->quote($p['updated_at']);
+                            }
+
+                            $inList = implode(',', array_map(function ($v) use ($pdo) { return $pdo->quote($v); }, $ids));
+
+                            $sql = "UPDATE `users` SET `last_used_branch_id` = CASE `user_id`" . $caseBranch . " END, `updated_at` = CASE `user_id`" . $caseUpdated . " END WHERE `user_id` IN (" . $inList . ")";
+                            $targetDb->statement($sql);
+                            $appUserRows += $existingCount;
+                        }
+                    }
+                } else {
+                    // If legacy `users` source is missing, do nothing — users already created from pos_userfile.
+                }
 
                 // 2. userreporttypefile → mf_user_report_types
                 if ($this->sourceTableExists($sourceDb, 'userreporttypefile')) {
@@ -979,6 +1072,57 @@ class DataTransferController extends Controller
 
                 $totalRows += $taxCodeRows;
                 $transferredTables[] = "{$oldTableName} → {$newTableName} ({$taxCodeRows} row(s))";
+            }
+            #endregion
+
+            #region Evat Code Conversion
+            if ($evatCode) {
+                $oldTableName = 'evatcodefile';
+                $newTableName = 'mf_evat_codes';
+                $chunkSize = 500;
+                $evatCodeRows = 0;
+                $payload = [];
+
+                if ($this->sourceTableExists($sourceDb, $oldTableName)) {
+                    $targetDb->statement('SET FOREIGN_KEY_CHECKS = 0');
+                    $targetDb->table($newTableName)->delete();
+                    $targetDb->statement('SET FOREIGN_KEY_CHECKS = 1');
+
+                    foreach ($sourceDb->table($oldTableName)->orderBy('recid')->lazy($chunkSize) as $old) {
+                        $payload[] = [
+                            'evat_id' => $old->evatcde,
+                            'evat_code' => $old->evatcde,
+                            'evat_percent' => $old->evatper,
+                            'debit_account_id' => $old->debactcde,
+                            'credit_account_id' => $old->creactcde,
+                            'return_credit_account_id' => $old->retactcde,
+                            'evat_type' => $old->evattyp,
+                            'gl_account_id' => $old->actcde,
+                            'consignment_account_id' => $old->actcdecon,
+                            'consignment_gl_department_id' => $old->gldepcdecon,
+                            'gl_department_id' => $old->gldepcde,
+                            'created_at' => $now,
+                            'updated_at' => $now,
+                        ];
+
+                        if (count($payload) >= $chunkSize) {
+                            $targetDb->table($newTableName)->insert($payload);
+                            $evatCodeRows += count($payload);
+                            $payload = [];
+                        }
+                    }
+
+                    if ($payload !== []) {
+                        $targetDb->table($newTableName)->insert($payload);
+                        $evatCodeRows += count($payload);
+                    }
+
+                    $totalRows += $evatCodeRows;
+                    $transferredTables[] = "{$oldTableName} → {$newTableName} ({$evatCodeRows} row(s))";
+                } else {
+                    $this->noteMissingSourceTable($oldTableName, $source, $target, $conversionNotes, 'evat_code');
+                    $transferredTables[] = "{$oldTableName} → {$newTableName} (skipped, source table not found)";
+                }
             }
             #endregion
 
@@ -1545,6 +1689,12 @@ class DataTransferController extends Controller
                 }
 
                 $validTaxIds = $targetDb->table('mf_vat_codes')->pluck('tax_id')->flip()->all();
+                $validEvatIds = [];
+                if ($this->sourceTableExists($targetDb, 'mf_evat_codes')) {
+                    foreach ($targetDb->table('mf_evat_codes')->pluck('evat_id') as $evatId) {
+                        $validEvatIds[(string) $evatId] = true;
+                    }
+                }
                 $validCurrencyIds = $targetDb->table('mf_currencies')->pluck('currency_id')->flip()->all();
                 $validMemcIds = $targetDb->table('mf_memcfile')->pluck('memc_id')->flip()->all();
 
@@ -1652,8 +1802,8 @@ class DataTransferController extends Controller
                         'purchase_tax_id' => $this->resolveForeignKeyId($old->purtaxcde, $validTaxIds, $nullifiedItemReferences),
                         'sales_ewt_id' => $this->resolveForeignKeyId($old->salewtcde, $validTaxIds, $nullifiedItemReferences),
                         'purchase_ewt_id' => $this->resolveForeignKeyId($old->purewtcde, $validTaxIds, $nullifiedItemReferences),
-                        'sales_evat_id' => $this->resolveForeignKeyId($old->salevatcde, $validTaxIds, $nullifiedItemReferences),
-                        'purchase_evat_id' => $this->resolveForeignKeyId($old->purevatcde, $validTaxIds, $nullifiedItemReferences),
+                        'sales_evat_id' => $this->resolveForeignKeyId($old->salevatcde, $validEvatIds, $nullifiedItemReferences),
+                        'purchase_evat_id' => $this->resolveForeignKeyId($old->purevatcde, $validEvatIds, $nullifiedItemReferences),
                         'sales_currency_id' => $this->resolveForeignKeyId($old->salcur, $validCurrencyIds, $nullifiedItemReferences),
                         'purchase_currency_id' => $this->resolveForeignKeyId($old->purcur, $validCurrencyIds, $nullifiedItemReferences),
                         'item_picture1' => $old->itmpic,
