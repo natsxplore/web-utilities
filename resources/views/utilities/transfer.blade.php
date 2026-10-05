@@ -180,6 +180,8 @@
                             ['id' => 'price_list', 'label' => 'Price List', 'hint' => null],
                             ['id' => 'inventory_transaction', 'label' => 'Inventory Transaction', 'hint' => 'trantypefile → mf_inventory_transactiontypes, inventorytranfile1/2 → trn_inventory_transaction_file1/2'],
                             ['id' => 'physical_count', 'label' => 'Physical Count', 'hint' => 'physicalcountfile1/2/3/31 → trn_physical_count_file1/2/3/31'],
+                            ['id' => 'sales', 'label' => 'Sales', 'hint' => 'salesfile1/2 → pos_sales_file1/2, plus related posfile and order discounts'],
+                            ['id' => 'sales_return', 'label' => 'Sales Return', 'hint' => 'salesreturnfile1/2 → pos_sales_return_file1/2, plus related posfile and order discounts'],
                         ] as $option)
                             <label class="flex items-start gap-3 rounded-md px-2 py-2 cursor-pointer hover:bg-zinc-50">
                                 <input type="checkbox" id="{{ $option['id'] }}" value="1" class="conversion-option mt-0.5 h-4 w-4 rounded border-zinc-300 text-emerald-600">

@@ -41,6 +41,8 @@ class DataTransferController extends Controller
         'price_list' => 'price_list',
         'inventory_transaction' => 'inventory_transaction',
         'physical_count' => 'physical_count',
+        'sales' => 'sales',
+        'sales_return' => 'sales_return',
     ];
 
     public function __construct(
@@ -95,6 +97,9 @@ class DataTransferController extends Controller
             $priceList = $request->boolean('price_list');
             $inventoryTransaction = $request->boolean('inventory_transaction');
             $physicalCount = $request->boolean('physical_count');
+            $sales = $request->boolean('sales');
+            $salesReturn = $request->boolean('sales_return');
+            $needsRelatedPosData = $sales || $salesReturn;
 
             [$source, $target] = $this->resolveDatabases($request);
 
@@ -295,6 +300,7 @@ class DataTransferController extends Controller
                     $payload[] = [
                         'branch_id' => $branchId,
                         'branch_description' => $old->brhdsc,
+                        // 'branch_prefix' => 'DAET',
                         'branch_prefix' => $old->prefix == null || $old->prefix == '' ? $this->generateBranchPrefix(
                             $this->optionalRowValue($old, 'prefix'),
                             $old->brhdsc,
@@ -3278,6 +3284,510 @@ class DataTransferController extends Controller
             }
             #endregion
 
+            #region Sales and Sales Return Conversion
+            if ($needsRelatedPosData) {
+                $chunkSize = 500;
+                $relatedDocNums = [];
+                $relatedRefNums = [];
+                $relatedOrderCodes = [];
+                $relatedOrderItemIds = [];
+                $validSalesDocNums = [];
+                $validSalesReturnDocNums = [];
+
+                $salesFile1Rows = 0;
+                $salesFile2Rows = 0;
+                $salesReturnFile1Rows = 0;
+                $salesReturnFile2Rows = 0;
+                $posFileRows = 0;
+                $orderItemDiscountRows = 0;
+                $orderDiscountRows = 0;
+
+                $skippedSalesFile1Rows = 0;
+                $skippedSalesFile2Rows = 0;
+                $skippedSalesReturnFile1Rows = 0;
+                $skippedSalesReturnFile2Rows = 0;
+                $skippedPosFileRows = 0;
+                $skippedOrderItemDiscountRows = 0;
+                $skippedOrderDiscountRows = 0;
+                $skippedPosFileDupes = 0;
+                $skippedOrderItemDiscountDupes = 0;
+                $skippedOrderDiscountDupes = 0;
+
+                $salesFile1SourceMissing = false;
+                $salesFile2SourceMissing = false;
+                $salesReturnFile1SourceMissing = false;
+                $salesReturnFile2SourceMissing = false;
+                $posFileSourceMissing = false;
+                $orderItemDiscountSourceMissing = false;
+                $orderDiscountSourceMissing = false;
+
+                $nullifiedPosWarehouses = 0;
+                $nullifiedPosBranches = 0;
+                $nullifiedPosItems = 0;
+                $nullifiedPosDineTypes = 0;
+                $nullifiedPosTaxIds = 0;
+                $nullifiedPosDiscountIds = 0;
+                $nullifiedSalesFile2BinIds = 0;
+                $nullifiedSalesFile2BatchIds = 0;
+                $nullifiedSalesReturnFile2BinIds = 0;
+                $nullifiedSalesReturnFile2BatchIds = 0;
+
+                $hasSalesSource = ($sales && (
+                    $this->sourceTableExists($sourceDb, 'salesfile1')
+                    || $this->sourceTableExists($sourceDb, 'salesfile2')
+                )) || ($salesReturn && (
+                    $this->sourceTableExists($sourceDb, 'salesreturnfile1')
+                    || $this->sourceTableExists($sourceDb, 'salesreturnfile2')
+                )) || $this->sourceTableExists($sourceDb, 'posfile')
+                    || $this->sourceTableExists($sourceDb, 'orderitemdiscountfile')
+                    || $this->sourceTableExists($sourceDb, 'orderdiscountfile');
+
+                if ($hasSalesSource) {
+                    $targetDb->statement('SET FOREIGN_KEY_CHECKS = 0');
+                    if ($needsRelatedPosData) {
+                        $targetDb->table('order_item_discount_file')->delete();
+                        $targetDb->table('order_discount_file')->delete();
+                        $targetDb->table('pos_file')->delete();
+                    }
+                    if ($salesReturn) {
+                        $targetDb->table('pos_sales_return_file2')->delete();
+                        $targetDb->table('pos_sales_return_file1')->delete();
+                    }
+                    if ($sales) {
+                        $targetDb->table('pos_sales_file2')->delete();
+                        $targetDb->table('pos_sales_file1')->delete();
+                    }
+                    $targetDb->statement('SET FOREIGN_KEY_CHECKS = 1');
+                }
+
+                $validBranchIds = $targetDb->table('mf_branch')->pluck('branch_id')->flip()->all();
+
+                $validItemIds = $targetDb->table('mf_items')->pluck('item_id')->flip()->all();
+                $validWarehouseIds = $targetDb->table('mf_warehouses')->pluck('warehouse_id')->flip()->all();
+                $validDineTypeIds = $targetDb->table('mf_dine_type_file')->pluck('dine_type_id')->flip()->all();
+                $validTaxIds = $targetDb->table('mf_vat_codes')->pluck('tax_id')->flip()->all();
+                $validDiscountIds = $targetDb->table('mf_discounts')->pluck('discount_id')->flip()->all();
+
+                $validBinIds = $this->sourceTableExists($targetDb, 'mf_bins')
+                    ? $targetDb->table('mf_bins')->pluck('bin_id')->flip()->all()
+                    : [];
+                $validBatchIds = $this->sourceTableExists($targetDb, 'mf_batches')
+                    ? $targetDb->table('mf_batches')->pluck('batch_id')->flip()->all()
+                    : ($this->sourceTableExists($targetDb, 'mf_batch')
+                        ? $targetDb->table('mf_batch')->pluck('batch_id')->flip()->all()
+                        : []);
+
+                $collectRelatedHeaderKeys = function (object $old) use (&$relatedDocNums, &$relatedRefNums): void {
+                    $docnum = trim((string) ($this->optionalRowValue($old, 'docnum') ?? ''));
+                    if ($docnum !== '') {
+                        $relatedDocNums[$docnum] = true;
+                    }
+
+                    $refnum = trim((string) ($this->optionalRowValue($old, 'refnum') ?? ''));
+                    if ($refnum !== '') {
+                        $relatedRefNums[$refnum] = true;
+                    }
+                };
+
+                // 1. salesfile1 → pos_sales_file1
+                if ($sales) {
+                    if ($this->sourceTableExists($sourceDb, 'salesfile1')) {
+                        $payload = [];
+
+                        foreach ($sourceDb->table('salesfile1')->orderBy('recid')->lazy($chunkSize) as $old) {
+                            $docnum = trim((string) ($this->optionalRowValue($old, 'docnum') ?? ''));
+                            if ($docnum === '') {
+                                $skippedSalesFile1Rows++;
+
+                                continue;
+                            }
+
+                            $validSalesDocNums[$docnum] = true;
+                            $collectRelatedHeaderKeys($old);
+                            $payload[] = $this->mapPosSalesFile1Row($old);
+
+                            if (count($payload) >= $chunkSize) {
+                                $targetDb->table('pos_sales_file1')->insert($payload);
+                                $salesFile1Rows += count($payload);
+                                $totalRows += count($payload);
+                                $payload = [];
+                            }
+                        }
+
+                        if ($payload !== []) {
+                            $targetDb->table('pos_sales_file1')->insert($payload);
+                            $salesFile1Rows += count($payload);
+                            $totalRows += count($payload);
+                        }
+                    } else {
+                        $salesFile1SourceMissing = true;
+                        $this->noteMissingSourceTable('salesfile1', $source, $target, $conversionNotes, 'sales');
+                    }
+
+                    // 2. salesfile2 → pos_sales_file2
+                    if ($this->sourceTableExists($sourceDb, 'salesfile2')) {
+                        $payload = [];
+
+                        foreach ($sourceDb->table('salesfile2')->orderBy('recid')->lazy($chunkSize) as $old) {
+                            $docnum = trim((string) ($this->optionalRowValue($old, 'docnum') ?? ''));
+                            if ($docnum === '' || ! isset($validSalesDocNums[$docnum])) {
+                                $skippedSalesFile2Rows++;
+
+                                continue;
+                            }
+
+                            $payload[] = $this->mapPosSalesFile2Row(
+                                $old,
+                                $validBinIds,
+                                $validBatchIds,
+                                $nullifiedSalesFile2BinIds,
+                                $nullifiedSalesFile2BatchIds,
+                            );
+
+                            if (count($payload) >= $chunkSize) {
+                                $targetDb->table('pos_sales_file2')->insert($payload);
+                                $salesFile2Rows += count($payload);
+                                $totalRows += count($payload);
+                                $payload = [];
+                            }
+                        }
+
+                        if ($payload !== []) {
+                            $targetDb->table('pos_sales_file2')->insert($payload);
+                            $salesFile2Rows += count($payload);
+                            $totalRows += count($payload);
+                        }
+                    } else {
+                        $salesFile2SourceMissing = true;
+                        $this->noteMissingSourceTable('salesfile2', $source, $target, $conversionNotes, 'sales');
+                    }
+                }
+
+                // 3. salesreturnfile1 → pos_sales_return_file1
+                if ($salesReturn) {
+                    if ($this->sourceTableExists($sourceDb, 'salesreturnfile1')) {
+                        $payload = [];
+
+                        foreach ($sourceDb->table('salesreturnfile1')->orderBy('recid')->lazy($chunkSize) as $old) {
+                            $docnum = trim((string) ($this->optionalRowValue($old, 'docnum') ?? ''));
+                            if ($docnum === '') {
+                                $skippedSalesReturnFile1Rows++;
+
+                                continue;
+                            }
+
+                            $validSalesReturnDocNums[$docnum] = true;
+                            $collectRelatedHeaderKeys($old);
+                            $payload[] = $this->mapPosSalesReturnFile1Row($old);
+
+                            if (count($payload) >= $chunkSize) {
+                                $targetDb->table('pos_sales_return_file1')->insert($payload);
+                                $salesReturnFile1Rows += count($payload);
+                                $totalRows += count($payload);
+                                $payload = [];
+                            }
+                        }
+
+                        if ($payload !== []) {
+                            $targetDb->table('pos_sales_return_file1')->insert($payload);
+                            $salesReturnFile1Rows += count($payload);
+                            $totalRows += count($payload);
+                        }
+                    } else {
+                        $salesReturnFile1SourceMissing = true;
+                        $this->noteMissingSourceTable('salesreturnfile1', $source, $target, $conversionNotes, 'sales_return');
+                    }
+
+                    // 4. salesreturnfile2 → pos_sales_return_file2
+                    if ($this->sourceTableExists($sourceDb, 'salesreturnfile2')) {
+                        $payload = [];
+
+                        foreach ($sourceDb->table('salesreturnfile2')->orderBy('recid')->lazy($chunkSize) as $old) {
+                            $docnum = trim((string) ($this->optionalRowValue($old, 'docnum') ?? ''));
+                            if ($docnum === '' || ! isset($validSalesReturnDocNums[$docnum])) {
+                                $skippedSalesReturnFile2Rows++;
+
+                                continue;
+                            }
+
+                            $payload[] = $this->mapPosSalesReturnFile2Row(
+                                $old,
+                                $validBinIds,
+                                $validBatchIds,
+                                $nullifiedSalesReturnFile2BinIds,
+                                $nullifiedSalesReturnFile2BatchIds,
+                            );
+
+                            if (count($payload) >= $chunkSize) {
+                                $targetDb->table('pos_sales_return_file2')->insert($payload);
+                                $salesReturnFile2Rows += count($payload);
+                                $totalRows += count($payload);
+                                $payload = [];
+                            }
+                        }
+
+                        if ($payload !== []) {
+                            $targetDb->table('pos_sales_return_file2')->insert($payload);
+                            $salesReturnFile2Rows += count($payload);
+                            $totalRows += count($payload);
+                        }
+                    } else {
+                        $salesReturnFile2SourceMissing = true;
+                        $this->noteMissingSourceTable('salesreturnfile2', $source, $target, $conversionNotes, 'sales_return');
+                    }
+                }
+
+                // Build related POS order keys from converted sales/return documents.
+                // if ($relatedDocNums !== [] || $relatedRefNums !== []) {
+                //     if ($this->sourceTableExists($sourceDb, 'posfile')) {
+                //         foreach ($sourceDb->table('posfile')->orderBy('recid')->lazy($chunkSize) as $old) {
+                //             if (! $this->posFileMatchesDocRefKeys($old, $relatedDocNums, $relatedRefNums)) {
+                //                 continue;
+                //             }
+
+                //             $orderCde = trim((string) ($this->optionalRowValue($old, 'ordercde') ?? ''));
+                //             if ($orderCde !== '') {
+                //                 $relatedOrderCodes[$orderCde] = true;
+                //             }
+
+                //             $orderItemId = trim((string) ($this->optionalRowValue($old, 'orderitmid') ?? ''));
+                //             if ($orderItemId !== '') {
+                //                 $relatedOrderItemIds[$orderItemId] = true;
+                //             }
+                //         }
+                //     }
+                // }
+
+                $seenPosFileKeys = [];
+                $seenOrderItemDiscountKeys = [];
+                $seenOrderDiscountKeys = [];
+
+                // 5. posfile → pos_file
+                if ($this->sourceTableExists($sourceDb, 'posfile')) {
+                    // if ($relatedDocNums === [] && $relatedRefNums === []) {
+                    //     $conversionNotes[] = 'Skipped posfile → pos_file: no related sales or sales return document keys were collected.';
+                    // } else {
+                        $payload = [];
+
+                        foreach ($sourceDb->table('posfile')->orderBy('recid')->lazy($chunkSize) as $old) {
+                            // if (! $this->posFileShouldInclude(
+                            //     $old,
+                            //     $relatedDocNums,
+                            //     $relatedRefNums,
+                            //     $relatedOrderCodes,
+                            //     $relatedOrderItemIds,
+                            // )) {
+                            //     continue;
+                            // }
+
+                            // $dedupeKey = $this->posFileDedupeKey($old);
+                            // if (isset($seenPosFileKeys[$dedupeKey])) {
+                            //     $skippedPosFileDupes++;
+
+                            //     continue;
+                            // }
+                            // $seenPosFileKeys[$dedupeKey] = true;
+
+                            $payload[] = $this->mapPosFileRow(
+                                $old,
+                                $now,
+                                $validBranchIds,
+                                $validItemIds,
+                                $validWarehouseIds,
+                                $validDineTypeIds,
+                                $validTaxIds,
+                                $validDiscountIds,
+                                $nullifiedPosBranches,
+                                $nullifiedPosItems,
+                                $nullifiedPosWarehouses,
+                                $nullifiedPosDineTypes,
+                                $nullifiedPosTaxIds,
+                                $nullifiedPosDiscountIds,
+                            );
+
+                            if (count($payload) >= $chunkSize) {
+                                $targetDb->table('pos_file')->insert($payload);
+                                $posFileRows += count($payload);
+                                $totalRows += count($payload);
+                                $payload = [];
+                            }
+                        }
+
+                        if ($payload !== []) {
+                            $targetDb->table('pos_file')->insert($payload);
+                            $posFileRows += count($payload);
+                            $totalRows += count($payload);
+                        }
+                    // }
+                } else {
+                    $posFileSourceMissing = true;
+                    $this->noteMissingSourceTable('posfile', $source, $target, $conversionNotes, 'sales');
+                }
+
+                // 6. orderitemdiscountfile → order_item_discount_file
+                if ($this->sourceTableExists($sourceDb, 'orderitemdiscountfile')) {
+                    // if ($relatedDocNums === [] && $relatedRefNums === [] && $relatedOrderCodes === [] && $relatedOrderItemIds === []) {
+                    //     $conversionNotes[] = 'Skipped orderitemdiscountfile → order_item_discount_file: no related keys were collected.';
+                    // } else {
+                        $payload = [];
+
+                        foreach ($sourceDb->table('orderitemdiscountfile')->orderBy('recid')->lazy($chunkSize) as $old) {
+                            // if (! $this->orderDiscountRowShouldInclude(
+                            //     $old,
+                            //     $relatedDocNums,
+                            //     $relatedOrderCodes,
+                            //     $relatedOrderItemIds,
+                            // )) {
+                            //     continue;
+                            // }
+
+                            // $dedupeKey = $this->orderItemDiscountDedupeKey($old);
+                            // if (isset($seenOrderItemDiscountKeys[$dedupeKey])) {
+                            //     $skippedOrderItemDiscountDupes++;
+
+                            //     continue;
+                            // }
+                            // $seenOrderItemDiscountKeys[$dedupeKey] = true;
+
+                            $payload[] = $this->mapOrderItemDiscountRow($old, $now);
+
+                            if (count($payload) >= $chunkSize) {
+                                $targetDb->table('order_item_discount_file')->insert($payload);
+                                $orderItemDiscountRows += count($payload);
+                                $totalRows += count($payload);
+                                $payload = [];
+                            }
+                        }
+
+                        if ($payload !== []) {
+                            $targetDb->table('order_item_discount_file')->insert($payload);
+                            $orderItemDiscountRows += count($payload);
+                            $totalRows += count($payload);
+                        }
+                    // }
+                } else {
+                    $orderItemDiscountSourceMissing = true;
+                    $this->noteMissingSourceTable('orderitemdiscountfile', $source, $target, $conversionNotes, 'sales');
+                }
+
+                // 7. orderdiscountfile → order_discount_file
+                if ($this->sourceTableExists($sourceDb, 'orderdiscountfile')) {
+                    // if ($relatedDocNums === [] && $relatedRefNums === [] && $relatedOrderCodes === [] && $relatedOrderItemIds === []) {
+                    //     $conversionNotes[] = 'Skipped orderdiscountfile → order_discount_file: no related keys were collected.';
+                    // } else {
+                        $payload = [];
+
+                        foreach ($sourceDb->table('orderdiscountfile')->orderBy('recid')->lazy($chunkSize) as $old) {
+                            // if (! $this->orderDiscountRowShouldInclude(
+                            //     $old,
+                            //     $relatedDocNums,
+                            //     $relatedOrderCodes,
+                            //     $relatedOrderItemIds,
+                            // )) {
+                            //     continue;
+                            // }
+
+                            // $dedupeKey = $this->orderDiscountDedupeKey($old);
+                            // if (isset($seenOrderDiscountKeys[$dedupeKey])) {
+                            //     $skippedOrderDiscountDupes++;
+
+                            //     continue;
+                            // }
+                            // $seenOrderDiscountKeys[$dedupeKey] = true;
+
+                            $payload[] = $this->mapOrderDiscountRow($old, $now);
+
+                            if (count($payload) >= $chunkSize) {
+                                $targetDb->table('order_discount_file')->insert($payload);
+                                $orderDiscountRows += count($payload);
+                                $totalRows += count($payload);
+                                $payload = [];
+                            }
+                        }
+
+                        if ($payload !== []) {
+                            $targetDb->table('order_discount_file')->insert($payload);
+                            $orderDiscountRows += count($payload);
+                            $totalRows += count($payload);
+                        }
+                    // }
+                } else {
+                    $orderDiscountSourceMissing = true;
+                    $this->noteMissingSourceTable('orderdiscountfile', $source, $target, $conversionNotes, 'sales');
+                }
+
+                if ($sales) {
+                    $salesFile1Summary = $salesFile1SourceMissing
+                        ? 'salesfile1 → pos_sales_file1 (skipped, source table not found)'
+                        : "salesfile1 → pos_sales_file1 ({$salesFile1Rows} row(s))";
+                    if ($skippedSalesFile1Rows > 0) {
+                        $salesFile1Summary .= ", {$skippedSalesFile1Rows} skipped";
+                    }
+                    $transferredTables[] = $salesFile1Summary;
+
+                    $salesFile2Summary = $salesFile2SourceMissing
+                        ? 'salesfile2 → pos_sales_file2 (skipped, source table not found)'
+                        : "salesfile2 → pos_sales_file2 ({$salesFile2Rows} row(s))";
+                    if ($skippedSalesFile2Rows > 0) {
+                        $salesFile2Summary .= ", {$skippedSalesFile2Rows} skipped";
+                    }
+                    $transferredTables[] = $salesFile2Summary;
+                }
+
+                if ($salesReturn) {
+                    $salesReturnFile1Summary = $salesReturnFile1SourceMissing
+                        ? 'salesreturnfile1 → pos_sales_return_file1 (skipped, source table not found)'
+                        : "salesreturnfile1 → pos_sales_return_file1 ({$salesReturnFile1Rows} row(s))";
+                    if ($skippedSalesReturnFile1Rows > 0) {
+                        $salesReturnFile1Summary .= ", {$skippedSalesReturnFile1Rows} skipped";
+                    }
+                    $transferredTables[] = $salesReturnFile1Summary;
+
+                    $salesReturnFile2Summary = $salesReturnFile2SourceMissing
+                        ? 'salesreturnfile2 → pos_sales_return_file2 (skipped, source table not found)'
+                        : "salesreturnfile2 → pos_sales_return_file2 ({$salesReturnFile2Rows} row(s))";
+                    if ($skippedSalesReturnFile2Rows > 0) {
+                        $salesReturnFile2Summary .= ", {$skippedSalesReturnFile2Rows} skipped";
+                    }
+                    $transferredTables[] = $salesReturnFile2Summary;
+                }
+
+                $posFileSummary = $posFileSourceMissing
+                    ? 'posfile → pos_file (skipped, source table not found)'
+                    : "posfile → pos_file ({$posFileRows} row(s))";
+                if ($skippedPosFileDupes > 0) {
+                    $posFileSummary .= ", {$skippedPosFileDupes} duplicate(s) skipped";
+                }
+                $transferredTables[] = $posFileSummary;
+
+                $orderItemDiscountSummary = $orderItemDiscountSourceMissing
+                    ? 'orderitemdiscountfile → order_item_discount_file (skipped, source table not found)'
+                    : "orderitemdiscountfile → order_item_discount_file ({$orderItemDiscountRows} row(s))";
+                if ($skippedOrderItemDiscountDupes > 0) {
+                    $orderItemDiscountSummary .= ", {$skippedOrderItemDiscountDupes} duplicate(s) skipped";
+                }
+                $transferredTables[] = $orderItemDiscountSummary;
+
+                $orderDiscountSummary = $orderDiscountSourceMissing
+                    ? 'orderdiscountfile → order_discount_file (skipped, source table not found)'
+                    : "orderdiscountfile → order_discount_file ({$orderDiscountRows} row(s))";
+                if ($skippedOrderDiscountDupes > 0) {
+                    $orderDiscountSummary .= ", {$skippedOrderDiscountDupes} duplicate(s) skipped";
+                }
+                $transferredTables[] = $orderDiscountSummary;
+
+                if ($nullifiedPosWarehouses > 0) {
+                    $conversionNotes[] = "Set pos_file warehouse_id to null for {$nullifiedPosWarehouses} row(s) with invalid warehouse references.";
+                }
+                if ($nullifiedPosBranches > 0) {
+                    $conversionNotes[] = "Set pos_file branch_id to null for {$nullifiedPosBranches} row(s) with invalid branch references.";
+                }
+                if ($nullifiedPosItems > 0) {
+                    $conversionNotes[] = "Set pos_file item_id to null for {$nullifiedPosItems} row(s) with invalid item references.";
+                }
+            }
+            #endregion
+
             if ($totalRows === 0) {
                 throw new RuntimeException('No rows were transferred.');
             }
@@ -3615,6 +4125,587 @@ class DataTransferController extends Controller
         ]);
 
         return [$userId, true];
+    }
+
+    protected function extractTimeValue(mixed $value): ?string
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        $stringValue = trim((string) $value);
+        if ($stringValue === '') {
+            return null;
+        }
+
+        if (str_contains($stringValue, ' ')) {
+            $parts = explode(' ', $stringValue);
+
+            return end($parts) ?: null;
+        }
+
+        return $stringValue;
+    }
+
+    /**
+     * @param  array<string, true>  $relatedDocNums
+     * @param  array<string, true>  $relatedRefNums
+     */
+    protected function posFileMatchesDocRefKeys(object $row, array $relatedDocNums, array $relatedRefNums): bool
+    {
+        foreach (['docnum', 'ordocnum', 'billdocnum'] as $field) {
+            $value = trim((string) ($this->optionalRowValue($row, $field) ?? ''));
+            if ($value !== '' && isset($relatedDocNums[$value])) {
+                return true;
+            }
+        }
+
+        $refnum = trim((string) ($this->optionalRowValue($row, 'refnum') ?? ''));
+        if ($refnum !== '' && isset($relatedRefNums[$refnum])) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @param  array<string, true>  $relatedDocNums
+     * @param  array<string, true>  $relatedRefNums
+     * @param  array<string, true>  $relatedOrderCodes
+     * @param  array<string, true>  $relatedOrderItemIds
+     */
+    protected function posFileShouldInclude(
+        object $row,
+        array $relatedDocNums,
+        array $relatedRefNums,
+        array $relatedOrderCodes,
+        array $relatedOrderItemIds,
+    ): bool {
+        if ($this->posFileMatchesDocRefKeys($row, $relatedDocNums, $relatedRefNums)) {
+            return true;
+        }
+
+        $orderCde = trim((string) ($this->optionalRowValue($row, 'ordercde') ?? ''));
+        if ($orderCde !== '' && isset($relatedOrderCodes[$orderCde])) {
+            return true;
+        }
+
+        $orderItemId = trim((string) ($this->optionalRowValue($row, 'orderitmid') ?? ''));
+        if ($orderItemId !== '' && isset($relatedOrderItemIds[$orderItemId])) {
+            return true;
+        }
+
+        return false;
+    }
+
+    protected function posFileDedupeKey(object $row): string
+    {
+        $docnum = trim((string) ($this->optionalRowValue($row, 'docnum') ?? ''));
+        $trncde = trim((string) ($this->optionalRowValue($row, 'trncde') ?? ''));
+        $orderCde = trim((string) ($this->optionalRowValue($row, 'ordercde') ?? ''));
+        $orderItemId = trim((string) ($this->optionalRowValue($row, 'orderitmid') ?? ''));
+        $recid = (string) ($this->optionalRowValue($row, 'recid') ?? '');
+        $refund = (int) ($this->optionalRowValue($row, 'refund') ?? 0);
+        $void = (int) ($this->optionalRowValue($row, 'void') ?? 0);
+        $ordocnum = trim((string) ($this->optionalRowValue($row, 'ordocnum') ?? ''));
+        $itmcde = trim((string) ($this->optionalRowValue($row, 'itmcde') ?? ''));
+
+        if ($docnum !== '' || $trncde !== '' || $orderCde !== '' || $orderItemId !== '' || $refund !== 0 || $void !== 0 || $ordocnum !== '' || $itmcde !== '') {
+            return "doc:{$docnum}|trn:{$trncde}|ord:{$orderCde}|itm:{$orderItemId}|refund:{$refund}|void:{$void}|ordoc:{$ordocnum}|itm:{$itmcde}";
+        }
+
+        return "recid:{$recid}";
+    }
+
+    protected function orderItemDiscountDedupeKey(object $row): string
+    {
+        $orderCde = trim((string) ($this->optionalRowValue($row, 'ordercde') ?? ''));
+        $orderItemId = trim((string) ($this->optionalRowValue($row, 'orderitmid') ?? ''));
+        $discde = trim((string) ($this->optionalRowValue($row, 'discde') ?? ''));
+        $disid = trim((string) ($this->optionalRowValue($row, 'disid') ?? ''));
+        $recid = (string) ($this->optionalRowValue($row, 'recid') ?? '');
+
+        if ($orderCde !== '' || $orderItemId !== '' || $discde !== '' || $disid !== '') {
+            return "ord:{$orderCde}|itm:{$orderItemId}|disc:{$discde}|disid:{$disid}";
+        }
+
+        return "recid:{$recid}";
+    }
+
+    protected function orderDiscountDedupeKey(object $row): string
+    {
+        $orderCde = trim((string) ($this->optionalRowValue($row, 'ordercde') ?? ''));
+        $orderItemId = trim((string) ($this->optionalRowValue($row, 'orderitmid') ?? ''));
+        $discde = trim((string) ($this->optionalRowValue($row, 'discde') ?? ''));
+        $billDocnum = trim((string) ($this->optionalRowValue($row, 'billdocnum') ?? ''));
+        $recid = (string) ($this->optionalRowValue($row, 'recid') ?? '');
+
+        if ($orderCde !== '' || $orderItemId !== '' || $discde !== '' || $billDocnum !== '') {
+            return "ord:{$orderCde}|itm:{$orderItemId}|disc:{$discde}|bill:{$billDocnum}";
+        }
+
+        return "recid:{$recid}";
+    }
+
+    /**
+     * @param  array<string, true>  $relatedDocNums
+     * @param  array<string, true>  $relatedOrderCodes
+     * @param  array<string, true>  $relatedOrderItemIds
+     */
+    protected function orderDiscountRowShouldInclude(
+        object $row,
+        array $relatedDocNums,
+        array $relatedOrderCodes,
+        array $relatedOrderItemIds,
+    ): bool {
+        $orderCde = trim((string) ($this->optionalRowValue($row, 'ordercde') ?? ''));
+        if ($orderCde !== '' && isset($relatedOrderCodes[$orderCde])) {
+            return true;
+        }
+
+        $orderItemId = trim((string) ($this->optionalRowValue($row, 'orderitmid') ?? ''));
+        if ($orderItemId !== '' && isset($relatedOrderItemIds[$orderItemId])) {
+            return true;
+        }
+
+        $billDocnum = trim((string) ($this->optionalRowValue($row, 'billdocnum') ?? ''));
+        if ($billDocnum !== '' && isset($relatedDocNums[$billDocnum])) {
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    protected function mapPosSalesFile1Row(object $old): array
+    {
+        return [
+            'recid' => $this->optionalRowValue($old, 'recid'),
+            'docnum' => $this->optionalRowValue($old, 'docnum'),
+            'docapp' => $this->optionalRowValue($old, 'docapp', 0),
+            'trncde' => $this->optionalRowValue($old, 'trncde'),
+            'trndte' => $this->optionalRowValue($old, 'trndte'),
+            'duedate' => $this->optionalRowValue($old, 'duedate'),
+            'logdte' => $this->optionalRowValue($old, 'logdte'),
+            'logtim' => $this->extractTimeValue($this->optionalRowValue($old, 'logtim')),
+            'doclock' => $this->optionalRowValue($old, 'doclock', 'N'),
+            'cuscde' => $this->optionalRowValue($old, 'cuscde'),
+            'cusdsc' => $this->optionalRowValue($old, 'cusdsc'),
+            'cusadd1' => $this->optionalRowValue($old, 'cusadd1'),
+            'smncde' => $this->optionalRowValue($old, 'smncde'),
+            'trmcde' => $this->optionalRowValue($old, 'trmcde'),
+            'usrnam' => $this->optionalRowValue($old, 'usrnam'),
+            'curcde' => $this->optionalRowValue($old, 'curcde'),
+            'currte' => $this->optionalRowValue($old, 'currte', 0),
+            'trntotfor' => $this->optionalRowValue($old, 'trntotfor', 0),
+            'textprcfor' => $this->optionalRowValue($old, 'textprcfor', 0),
+            'vatamtfor' => $this->optionalRowValue($old, 'vatamtfor', 0),
+            'netvatamtfor' => $this->optionalRowValue($old, 'netvatamtfor', 0),
+            'vatableamtfor' => $this->optionalRowValue($old, 'vatableamtfor', 0),
+            'vatexemptamtfor' => $this->optionalRowValue($old, 'vatexemptamtfor', 0),
+            'totamtdisfor' => $this->optionalRowValue($old, 'totamtdisfor', 0),
+            'totgroextfor' => $this->optionalRowValue($old, 'totgroextfor', 0),
+            'netamtfor' => $this->optionalRowValue($old, 'netamtfor', 0),
+            'docbalfor' => $this->optionalRowValue($old, 'docbalfor', 0),
+            'trntot' => $this->optionalRowValue($old, 'trntot', 0),
+            'textprc' => $this->optionalRowValue($old, 'textprc', 0),
+            'vatamt' => $this->optionalRowValue($old, 'vatamt', 0),
+            'netvatamt' => $this->optionalRowValue($old, 'netvatamt', 0),
+            'vatableamt' => $this->optionalRowValue($old, 'vatableamt', 0),
+            'vatexemptamt' => $this->optionalRowValue($old, 'vatexemptamt', 0),
+            'totamtdis' => $this->optionalRowValue($old, 'totamtdis', 0),
+            'totgroext' => $this->optionalRowValue($old, 'totgroext', 0),
+            'netamt' => $this->optionalRowValue($old, 'netamt', 0),
+            'docbal' => $this->optionalRowValue($old, 'docbal', 0),
+            'manualewt' => $this->optionalRowValue($old, 'manualewt', 0),
+            'brhcde' => $this->optionalRowValue($old, 'brhcde'),
+            'posale_docnum' => null,
+            'postrmno' => null,
+            'zero_rated_sales' => $this->optionalRowValue($old, 'vatzeroratedamt', 0),
+        ];
+    }
+
+    protected function mapPosSalesFile2Row(
+        object $old,
+        array $validBinIds,
+        array $validBatchIds,
+        ?int &$nullifiedBinIds,
+        ?int &$nullifiedBatchIds,
+    ): array {
+        $disccde = $this->optionalRowValue($old, 'disccde');
+
+        return [
+            'recid' => $this->optionalRowValue($old, 'recid'),
+            'docnum' => $this->optionalRowValue($old, 'docnum'),
+            'trncde' => $this->optionalRowValue($old, 'trncde'),
+            'trndte' => $this->optionalRowValue($old, 'trndte'),
+            'logdte' => $this->optionalRowValue($old, 'logdte'),
+            'logtim' => $this->extractTimeValue($this->optionalRowValue($old, 'logtim')),
+            'linenum' => $this->optionalRowValue($old, 'linenum', 0),
+            'dettyp' => $this->optionalRowValue($old, 'dettyp'),
+            'linegrp' => $this->optionalRowValue($old, 'linegrp'),
+            'copyline' => $this->optionalRowValue($old, 'copyline', 0),
+            'chkasy' => $this->optionalRowValue($old, 'chkasy', 0),
+            'cuscde' => $this->optionalRowValue($old, 'cuscde'),
+            'cusdsc' => $this->optionalRowValue($old, 'cusdsc'),
+            'itmcde' => $this->optionalRowValue($old, 'itmcde'),
+            'itmdsc' => $this->optionalRowValue($old, 'itmdsc'),
+            'itmtyp' => $this->optionalRowValue($old, 'itmtyp'),
+            'itmqty' => $this->optionalRowValue($old, 'itmqty', 0),
+            'untmea' => $this->optionalRowValue($old, 'untmea'),
+            'factor' => $this->optionalRowValue($old, 'factor', 0),
+            'barcodenum' => $this->optionalRowValue($old, 'barcodenum'),
+            'barcde' => $this->optionalRowValue($old, 'barcde'),
+            'warcde' => $this->optionalRowValue($old, 'warcde'),
+            'prccde' => $this->optionalRowValue($old, 'prccde'),
+            'prcdst1' => $this->optionalRowValue($old, 'prcdst1', 0),
+            'prcdst2' => $this->optionalRowValue($old, 'prcdst2', 0),
+            'prcdst3' => $this->optionalRowValue($old, 'prcdst3', 0),
+            'disccde' => $disccde,
+            'discde' => $disccde,
+            'discper' => $this->optionalRowValue($old, 'discper', 0),
+            'disper' => $this->optionalRowValue($old, 'disper', 0),
+            'sonum' => $this->optionalRowValue($old, 'sonum'),
+            'smncde' => $this->optionalRowValue($old, 'smncde'),
+            'usrnam' => $this->optionalRowValue($old, 'usrnam'),
+            'curcde' => $this->optionalRowValue($old, 'curcde'),
+            'currte' => $this->optionalRowValue($old, 'currte', 0),
+            'conver1' => $this->optionalRowValue($old, 'conver1', 0),
+            'untprcfor' => $this->optionalRowValue($old, 'untprcfor', 0),
+            'groprcfor' => $this->optionalRowValue($old, 'groprcfor', 0),
+            'extprcfor' => $this->optionalRowValue($old, 'extprcfor', 0),
+            'disamtfor' => $this->optionalRowValue($old, 'disamtfor', 0),
+            'netvatamtfor' => $this->optionalRowValue($old, 'netvatamtfor', 0),
+            'vatamtfor' => $this->optionalRowValue($old, 'vatamtfor', 0),
+            'amtdisfor' => $this->optionalRowValue($old, 'amtdisfor', 0),
+            'groextfor' => $this->optionalRowValue($old, 'groextfor', 0),
+            'scpwdamtfor' => $this->optionalRowValue($old, 'scpwdamtfor', 0),
+            'untprc' => $this->optionalRowValue($old, 'untprc', 0),
+            'groprc' => $this->optionalRowValue($old, 'groprc', 0),
+            'extprc' => $this->optionalRowValue($old, 'extprc', 0),
+            'disamt' => $this->optionalRowValue($old, 'disamt', 0),
+            'netvatamt' => $this->optionalRowValue($old, 'netvatamt', 0),
+            'vatamt' => $this->optionalRowValue($old, 'vatamt', 0),
+            'amtdis' => $this->optionalRowValue($old, 'amtdis', 0),
+            'groext' => $this->optionalRowValue($old, 'groext', 0),
+            'scpwdamt' => $this->optionalRowValue($old, 'scpwdamt', 0),
+            'scpwddis' => $this->optionalRowValue($old, 'scpwddis', 0),
+            'taxcde' => $this->optionalRowValue($old, 'taxcde'),
+            'vatrte' => $this->optionalRowValue($old, 'vatrte', 0),
+            'brhcde' => $this->optionalRowValue($old, 'brhcde'),
+            'bin_number' => $this->optionalRowValue($old, '', 'MAIN'),
+            'batch_number' => $this->optionalRowValue($old, 'batchnum'),
+            'manufacturing_date' => $this->optionalRowValue($old, 'mfgdte'),
+            'expiration_date' => $this->optionalRowValue($old, 'expdte'),
+            'warehouse_number' => 'MAIN',
+            'warehouse_location_id' => 'LSTVDEFAULTWHSLOCATION1',
+            'zero_rated_sales' => 0,
+            'bin_id' => $this->resolveForeignKeyId($this->optionalRowValue($old, 'bin_id'), $validBinIds, $nullifiedBinIds),
+            'batch_id' => $this->resolveForeignKeyId($this->optionalRowValue($old, 'batch_id'), $validBatchIds, $nullifiedBatchIds),
+        ];
+    }
+
+    protected function mapPosSalesReturnFile1Row(object $old): array
+    {
+        return [
+            'recid' => $this->optionalRowValue($old, 'recid'),
+            'docnum' => $this->optionalRowValue($old, 'docnum'),
+            'warcde' => $this->optionalRowValue($old, 'warcde'),
+            'cusdsc' => $this->optionalRowValue($old, 'cusdsc'),
+            'trncde' => $this->optionalRowValue($old, 'trncde'),
+            'trntot' => $this->optionalRowValue($old, 'trntot', 0),
+            'smncde' => $this->optionalRowValue($old, 'smncde'),
+            'trmcde' => $this->optionalRowValue($old, 'trmcde'),
+            'cuscde' => $this->optionalRowValue($old, 'cuscde'),
+            'curcde' => $this->optionalRowValue($old, 'curcde'),
+            'usrnam' => $this->optionalRowValue($old, 'usrnam'),
+            'currte' => $this->optionalRowValue($old, 'currte', 0),
+            'vatamt' => $this->optionalRowValue($old, 'vatamt', 0),
+            'textprc' => $this->optionalRowValue($old, 'textprc', 0),
+            'trntotfor' => $this->optionalRowValue($old, 'trntotfor', 0),
+            'textprcfor' => $this->optionalRowValue($old, 'textprcfor', 0),
+            'docapp' => 0,
+            'docbal' => 0,
+            'netvatamt' => $this->optionalRowValue($old, 'netvatamt', 0),
+            'docbalfor' => 0,
+            'vatableamt' => $this->optionalRowValue($old, 'vatableamt', 0),
+            'vatexemptamt' => $this->optionalRowValue($old, 'vatexemptamt', 0),
+            'vatamtfor' => $this->optionalRowValue($old, 'vatamtfor', 0),
+            'netvatamtfor' => $this->optionalRowValue($old, 'netvatamtfor', 0),
+            'vatableamtfor' => $this->optionalRowValue($old, 'vatableamtfor', 0),
+            'vatexemptamtfor' => $this->optionalRowValue($old, 'vatexemptamtfor', 0),
+            'totamtdis' => $this->optionalRowValue($old, 'totamtdis', 0),
+            'totgroext' => $this->optionalRowValue($old, 'totgroext', 0),
+            'totamtdisfor' => $this->optionalRowValue($old, 'totamtdisfor', 0),
+            'totgroextfor' => $this->optionalRowValue($old, 'totgroextfor', 0),
+            'netamt' => $this->optionalRowValue($old, 'netamt', 0),
+            'netamtfor' => $this->optionalRowValue($old, 'netamtfor', 0),
+            'logtim' => $this->extractTimeValue($this->optionalRowValue($old, 'logtim')),
+            'cusadd1' => $this->optionalRowValue($old, 'cusadd1'),
+            'manualewt' => $this->optionalRowValue($old, 'manualewt', 0),
+            'doclock' => $this->optionalRowValue($old, 'doclock', 'N'),
+            'trndte' => $this->optionalRowValue($old, 'trndte'),
+            'duedate' => $this->optionalRowValue($old, 'duedate'),
+            'logdte' => $this->optionalRowValue($old, 'logdte'),
+            'brhcde' => $this->optionalRowValue($old, 'brhcde'),
+            'posale_docnum' => null,
+            'postrmno' => null,
+            'zero_rated_sales' => $this->optionalRowValue($old, 'vatzeroratedamt', 0),
+        ];
+    }
+
+    protected function mapPosSalesReturnFile2Row(
+        object $old,
+        array $validBinIds,
+        array $validBatchIds,
+        ?int &$nullifiedBinIds,
+        ?int &$nullifiedBatchIds,
+    ): array {
+        $disccde = $this->optionalRowValue($old, 'disccde');
+
+        return [
+            'recid' => $this->optionalRowValue($old, 'recid'),
+            'linegrp' => $this->optionalRowValue($old, 'linegrp'),
+            'chkasy' => $this->optionalRowValue($old, 'chkasy', 0),
+            'copyline' => $this->optionalRowValue($old, 'copyline', 0),
+            'scpwddis' => $this->optionalRowValue($old, 'scpwddis', 0),
+            'scpwdamt' => $this->optionalRowValue($old, 'scpwdamt', 0),
+            'scpwdamtfor' => $this->optionalRowValue($old, 'scpwdamtfor', 0),
+            'docnum' => $this->optionalRowValue($old, 'docnum'),
+            'cusdsc' => $this->optionalRowValue($old, 'cusdsc'),
+            'itmcde' => $this->optionalRowValue($old, 'itmcde'),
+            'itmdsc' => $this->optionalRowValue($old, 'itmdsc'),
+            'itmqty' => $this->optionalRowValue($old, 'itmqty', 0),
+            'untprc' => $this->optionalRowValue($old, 'untprc', 0),
+            'extprc' => $this->optionalRowValue($old, 'extprc', 0),
+            'trncde' => $this->optionalRowValue($old, 'trncde'),
+            'untmea' => $this->optionalRowValue($old, 'untmea'),
+            'prcdst1' => $this->optionalRowValue($old, 'prcdst1', 0),
+            'prcdst2' => $this->optionalRowValue($old, 'prcdst2', 0),
+            'prcdst3' => $this->optionalRowValue($old, 'prcdst3', 0),
+            'factor' => $this->optionalRowValue($old, 'factor', 0),
+            'linenum' => $this->optionalRowValue($old, 'linenum', 0),
+            'cuscde' => $this->optionalRowValue($old, 'cuscde'),
+            'warcde' => $this->optionalRowValue($old, 'warcde'),
+            'groprc' => $this->optionalRowValue($old, 'groprc', 0),
+            'prccde' => $this->optionalRowValue($old, 'prccde'),
+            'sonum' => $this->optionalRowValue($old, 'cmnum'),
+            'disamt' => $this->optionalRowValue($old, 'disamt', 0),
+            'conver1' => $this->optionalRowValue($old, 'conver1', 0),
+            'smncde' => $this->optionalRowValue($old, 'smncde'),
+            'usrnam' => $this->optionalRowValue($old, 'usrnam'),
+            'logtim' => $this->extractTimeValue($this->optionalRowValue($old, 'logtim')),
+            'curcde' => $this->optionalRowValue($old, 'curcde'),
+            'currte' => $this->optionalRowValue($old, 'currte', 0),
+            'untprcfor' => $this->optionalRowValue($old, 'untprcfor', 0),
+            'groprcfor' => $this->optionalRowValue($old, 'groprcfor', 0),
+            'extprcfor' => $this->optionalRowValue($old, 'extprcfor', 0),
+            'disper' => $this->optionalRowValue($old, 'disper', 0),
+            'itmtyp' => $this->optionalRowValue($old, 'itmtyp'),
+            'netvatamt' => $this->optionalRowValue($old, 'netvatamt', 0),
+            'taxcde' => $this->optionalRowValue($old, 'taxcde'),
+            'vatamt' => $this->optionalRowValue($old, 'vatamt', 0),
+            'vatrte' => $this->optionalRowValue($old, 'vatrte', 0),
+            'netvatamtfor' => $this->optionalRowValue($old, 'netvatamtfor', 0),
+            'vatamtfor' => $this->optionalRowValue($old, 'vatamtfor', 0),
+            'amtdis' => $this->optionalRowValue($old, 'amtdis', 0),
+            'groext' => $this->optionalRowValue($old, 'groext', 0),
+            'amtdisfor' => $this->optionalRowValue($old, 'amtdisfor', 0),
+            'groextfor' => $this->optionalRowValue($old, 'groextfor', 0),
+            'dettyp' => $this->optionalRowValue($old, 'dettyp'),
+            'trndte' => $this->optionalRowValue($old, 'trndte'),
+            'logdte' => $this->optionalRowValue($old, 'logdte'),
+            'barcodenum' => $this->optionalRowValue($old, 'barcodenum'),
+            'brhcde' => $this->optionalRowValue($old, 'brhcde'),
+            'barcde' => $this->optionalRowValue($old, 'barcde'),
+            'disccde' => $disccde,
+            'discper' => $this->optionalRowValue($old, 'discper', 0),
+            'bin_number' => $this->optionalRowValue($old, '', 'MAIN'),
+            'batch_number' => $this->optionalRowValue($old, 'batchnum'),
+            'manufacturing_date' => $this->optionalRowValue($old, 'mfgdte'),
+            'expiration_date' => $this->optionalRowValue($old, 'expdte'),
+            'warehouse_number' => 'MAIN',
+            'warehouse_location_id' => 'LSTVDEFAULTWHSLOCATION1',
+            'zero_rated_sales' => 0,
+            'bin_id' => $this->resolveForeignKeyId($this->optionalRowValue($old, 'bin_id'), $validBinIds, $nullifiedBinIds),
+            'batch_id' => $this->resolveForeignKeyId($this->optionalRowValue($old, 'batch_id'), $validBatchIds, $nullifiedBatchIds),
+        ];
+    }
+
+    protected function mapPosFileRow(
+        object $old,
+        mixed $now,
+        array $validBranchIds,
+        array $validItemIds,
+        array $validWarehouseIds,
+        array $validDineTypeIds,
+        array $validTaxIds,
+        array $validDiscountIds,
+        ?int &$nullifiedBranches,
+        ?int &$nullifiedItems,
+        ?int &$nullifiedWarehouses,
+        ?int &$nullifiedDineTypes,
+        ?int &$nullifiedTaxIds,
+        ?int &$nullifiedDiscountIds,
+    ): array {
+        return [
+            'created_at' => $now,
+            'updated_at' => $now,
+            'gov_discount' => $this->optionalRowValue($old, 'govdisc', 0),
+            'amount_discount' => $this->optionalRowValue($old, 'amtdis', 0),
+            'bill_document_number' => $this->optionalRowValue($old, 'billdocnum'),
+            'card_class' => $this->optionalRowValue($old, 'cardclass'),
+            'card_holder' => $this->optionalRowValue($old, 'cardholder'),
+            'card_number' => $this->optionalRowValue($old, 'cardno'),
+            'card_type' => $this->optionalRowValue($old, 'cardtype'),
+            'cashier' => $this->optionalRowValue($old, 'cashier'),
+            'discount_id' => $this->resolveForeignKeyId($this->optionalRowValue($old, 'discde'), $validDiscountIds, $nullifiedDiscountIds),
+            'discount_percent' => $this->optionalRowValue($old, 'disper'),
+            'discount_quantity' => $this->optionalRowValue($old, 'disqty', 0),
+            'extended_price' => $this->optionalRowValue($old, 'extprc', 0),
+            'free_reason' => $this->optionalRowValue($old, 'freereason'),
+            'gross_extended_amount' => $this->optionalRowValue($old, 'groext', 0),
+            'document_number' => $this->optionalRowValue($old, 'docnum'),
+            'item_id' => $this->optionalRowValue($old, 'itmcde'),
+            'main_item_id' => $this->optionalRowValue($old, 'mainitmid'),
+            'item_description' => $this->optionalRowValue($old, 'itmdsc'),
+            'item_quantity' => $this->optionalRowValue($old, 'itmqty', 0),
+            'log_time' => $this->optionalRowValue($old, 'logtim'),
+            'net_vat_amount' => $this->optionalRowValue($old, 'netvatamt', 0),
+            'number_pax' => $this->optionalRowValue($old, 'numpax', 0),
+            'order_item_id' => $this->optionalRowValue($old, 'orderitmid'),
+            'order_type' => $this->optionalRowValue($old, 'ordertyp'),
+            'order_id' => $this->optionalRowValue($old, 'ordercde'),
+            'official_receipt_document_number' => $this->optionalRowValue($old, 'ordocnum'),
+            'pos_transaction_type' => $this->optionalRowValue($old, 'postrntyp'),
+            'tin_number' => $this->optionalRowValue($old, 'tin'),
+            'transaction_code' => $this->optionalRowValue($old, 'trncde'),
+            'transaction_date' => $this->optionalRowValue($old, 'trndte'),
+            'unit_price' => $this->optionalRowValue($old, 'untprc', 0),
+            'vat_amount' => $this->optionalRowValue($old, 'vatamt', 0),
+            'void' => $this->optionalRowValue($old, 'void', 0),
+            'void_number' => $this->optionalRowValue($old, 'voidnum'),
+            'void_reason' => $this->optionalRowValue($old, 'voidreason'),
+            'branch_id' => $this->resolveForeignKeyId($this->optionalRowValue($old, 'brhcde'), $validBranchIds, $nullifiedBranches),
+            'dine_type_id' => $this->resolveForeignKeyId($this->optionalRowValue($old, 'postypcde'), $validDineTypeIds, $nullifiedDineTypes),
+            'warehouse_id' => $this->resolveForeignKeyId($this->optionalRowValue($old, 'warcde'), $validWarehouseIds, $nullifiedWarehouses),
+            'less_vat' => $this->optionalRowValue($old, 'lessvat', 0),
+            'vat_exempt' => $this->optionalRowValue($old, 'vatexempt', 0),
+            'transaction_status' => $this->optionalRowValue($old, 'trnstat'),
+            'refund_date' => $this->optionalRowValue($old, 'refunddte'),
+            'refund_log_time' => $this->optionalRowValue($old, 'refundlogtim'),
+            'refund' => $this->optionalRowValue($old, 'refund', 0),
+            'refund_reason' => $this->optionalRowValue($old, 'refundreason'),
+            'refund_quantity' => $this->optionalRowValue($old, 'refundqty', 0),
+            'tax_id' => $this->resolveForeignKeyId($this->optionalRowValue($old, 'taxcde'), $validTaxIds, $nullifiedTaxIds),
+            'batch_number' => $this->optionalRowValue($old, 'batchnum'),
+            'item_number' => $this->optionalRowValue($old, 'itmnum'),
+            'reference_number' => $this->optionalRowValue($old, 'refnum'),
+            'service_charge_discount' => $this->optionalRowValue($old, 'scharge_disc', 0),
+            'check_bank' => $this->optionalRowValue($old, 'chkbnk'),
+            'check_date' => $this->optionalRowValue($old, 'chkdte'),
+            'check_number' => $this->optionalRowValue($old, 'chknum'),
+            'discount_amount' => $this->optionalRowValue($old, 'disamt', 0),
+            'pos_terminal_number' => $this->optionalRowValue($old, 'terminalno'),
+            'service_charge' => $this->optionalRowValue($old, 'scharge', 0),
+            'upload_status' => $this->optionalRowValue($old, 'upload_status'),
+            'vat_percent' => $this->optionalRowValue($old, 'vatrte', 0),
+            'process_date' => $this->optionalRowValue($old, 'processdte'),
+            'transfer_date' => $this->optionalRowValue($old, 'trnsfrdte'),
+            'transfer_time' => $this->optionalRowValue($old, 'trnsfrtime'),
+            'is_add_on' => $this->optionalRowValue($old, 'isaddon', 0),
+            'item_pax_count' => $this->optionalRowValue($old, 'itmpaxcount', 0),
+            'table_code' => $this->optionalRowValue($old, 'postrmno'),
+            'table_description' => null,
+            'area_code' => null,
+            'bank_id' => $this->optionalRowValue($old, 'bnkcde'),
+            'net_vat_price' => $this->optionalRowValue($old, 'netvatprc', 0),
+            'gross_price' => $this->optionalRowValue($old, 'groprc', $this->optionalRowValue($old, 'grossprc', 0)),
+            'factor' => $this->optionalRowValue($old, 'factor', 0),
+            'transaction_number' => $this->optionalRowValue($old, 'linenum'),
+            'manual_reference' => $this->optionalRowValue($old, 'refnum'),
+            'manual_reason' => $this->optionalRowValue($old, 'freereason'),
+            'combo_meal_data' => $this->optionalRowValue($old, 'comboid'),
+            'changed' => $this->optionalRowValue($old, 'changed', 0),
+            'address' => $this->optionalRowValue($old, 'address'),
+            'dip_person_name' => null,
+            'dip_person_address' => null,
+            'dip_vic_no' => null,
+            'operation_date' => $this->optionalRowValue($old, 'trndte'),
+            'gross_price_amount' => $this->optionalRowValue($old, 'groext', 0),
+            'staff_id' => $this->optionalRowValue($old, 'usrnam'),
+            'zero_rated_sales' => 0,
+        ];
+    }
+
+    protected function mapOrderItemDiscountRow(object $old, mixed $now): array
+    {
+        return [
+            'created_at' => $now,
+            'updated_at' => $now,
+            'amount_discount' => $this->optionalRowValue($old, 'amtdis', 0),
+            'vat_exempt' => $this->optionalRowValue($old, 'exemptvat', 0),
+            'item_id' => $this->optionalRowValue($old, 'itmcde'),
+            'order_id' => $this->optionalRowValue($old, 'ordercde'),
+            'order_item_id' => $this->optionalRowValue($old, 'orderitmid'),
+            'gov_discount' => $this->optionalRowValue($old, 'govdisc', 0),
+            'less_vat_adj' => $this->optionalRowValue($old, 'lessvatadj', 0),
+            'sales_without_vat' => $this->optionalRowValue($old, 'salwoutvat', 0),
+            'no_less_vat' => $this->optionalRowValue($old, 'nolessvat', 0),
+            'service_charge' => $this->optionalRowValue($old, 'scharge', 0),
+            'service_charge_discount' => 0,
+            'zero_rated_sales' => 0,
+            'discount_code' => $this->optionalRowValue($old, 'discde'),
+            'discount_type' => $this->optionalRowValue($old, 'distyp'),
+            'discount_id' => $this->optionalRowValue($old, 'disid'),
+            'discount_percent' => $this->optionalRowValue($old, 'disper', 0),
+            'zero_rated' => 0,
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    protected function mapOrderDiscountRow(object $old, mixed $now): array
+    {
+        return [
+            'created_at' => $now,
+            'updated_at' => $now,
+            'address' => null,
+            'discount_code' => $this->optionalRowValue($old, 'discde'),
+            'discount_type' => $this->optionalRowValue($old, 'distyp'),
+            'discount_amount' => $this->optionalRowValue($old, 'disamt', 0),
+            'discount_percent' => $this->optionalRowValue($old, 'disper', 0),
+            'temp_id' => $this->optionalRowValue($old, 'tempid'),
+            'order_id' => $this->optionalRowValue($old, 'ordercde'),
+            'exempt_vat' => $this->optionalRowValue($old, 'exemptvat', 0),
+            'zero_rated' => 0,
+            'sc_number' => $this->optionalRowValue($old, 'scnum'),
+            'sc_name' => $this->optionalRowValue($old, 'scnam'),
+            'sc_date_issued' => $this->optionalRowValue($old, 'scdteissued'),
+            'pwd_number' => $this->optionalRowValue($old, 'pwdnum'),
+            'pwd_name' => $this->optionalRowValue($old, 'pwdnam'),
+            'pwd_date_issued' => $this->optionalRowValue($old, 'pwddteissued'),
+            'per_item' => $this->optionalRowValue($old, 'peritem', 0),
+            'order_item_id' => $this->optionalRowValue($old, 'orderitmid'),
+            'bill_document_number' => $this->optionalRowValue($old, 'billdocnum'),
+            'no_less_vat' => $this->optionalRowValue($old, 'nolessvat', 0),
+            'gov_discount' => $this->optionalRowValue($old, 'govdisc', 0),
+            'service_charge' => $this->optionalRowValue($old, 'scharge', 0),
+            'card_number' => null,
+            'card_holder' => null,
+            'sp_child_name' => null,
+            'sp_birth_date' => null,
+            'sp_child_age' => null,
+            'dip_person_name' => null,
+            'dip_person_address' => null,
+            'dip_vic_no' => null,
+            'tin_number' => null,
+            'memc' => null,
+            'memc_value' => null,
+        ];
     }
 
     protected function sourceTableExists(mixed $db, string $table): bool

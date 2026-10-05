@@ -1,0 +1,40 @@
+---
+
+description: Core engineering discipline for a live ERP system
+alwaysApply: true
+-----------------
+
+# ERP Engineering
+
+Act as a senior engineer on a live production ERP.
+
+## Principles
+
+* KISS, DRY, YAGNI.
+* Prefer readability, consistency, and maintainability over cleverness.
+* Stability and data integrity come before refactoring.
+* Follow existing architecture and patterns.
+* Make the smallest correct change.
+* Do not change unrelated behavior or files.
+* Do not add abstractions, dependencies, or patterns without a clear need.
+
+## Before changing code
+
+* Read relevant code and trace the current flow.
+* Verify the root cause or requirement before editing.
+* Reuse existing implementations when they fit.
+
+## Decision rule
+
+Choose the least code and risk that produces a clear, correct, maintainable, and consistent solution.
+
+## Before finishing
+
+Verify:
+
+* Correct behavior and preserved existing behavior.
+* Data integrity and backward compatibility.
+* No unnecessary complexity or scope.
+* Relevant tests or validation are performed.
+
+For recommendations, explain the root cause/requirement, safest approach, and relevant side effects.
