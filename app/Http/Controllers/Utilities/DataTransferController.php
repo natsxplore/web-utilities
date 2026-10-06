@@ -300,12 +300,11 @@ class DataTransferController extends Controller
                     $payload[] = [
                         'branch_id' => $branchId,
                         'branch_description' => $old->brhdsc,
-                        // 'branch_prefix' => 'DAET',
-                        'branch_prefix' => $old->prefix == null || $old->prefix == '' ? $this->generateBranchPrefix(
+                        'branch_prefix' => $this->generateBranchPrefix(
                             $this->optionalRowValue($old, 'prefix'),
                             $old->brhdsc,
                             $old->brhcde,
-                        ) : $old->prefix,
+                        ),
                         'business1' => $this->optionalRowValue($old, 'business1'),
                         'business2' => $this->optionalRowValue($old, 'business2'),
                         'business3' => $this->optionalRowValue($old, 'business3'),
